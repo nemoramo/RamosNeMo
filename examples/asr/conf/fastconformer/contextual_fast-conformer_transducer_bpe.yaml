@@ -1,0 +1,223 @@
+# Configuration for a Context-Aware Fast Conformer-Transducer ASR model (BPE)
+# Based on FastConformer Large variant.
+
+name: "ContextualFastConformer-Transducer-BPE-Large"
+
+model:
+  _target_: nemo.collections.asr.models.contextual_rnnt_models.ContextualEncDecRNNTModel
+  fine_tune_from_nemo_model: null
+  sample_rate: 16000
+  compute_eval_loss: false
+  log_prediction: true
+  rnnt_reduction: 'mean_volume'
+  skip_nan_grad: false
+
+  model_defaults: # These are used by the RNNTJoint's jointnet if not overridden there
+    enc_hidden: ${model.encoder.d_model} # Should match ConformerEncoder output dim
+    pred_hidden: 640  # Standard FastConformer Large prediction net hidden size
+    joint_hidden: 640 # Standard FastConformer Large joint net hidden size
+
+  train_ds:
+    _target_: nemo.collections.asr.data.contextual_audio_to_text_dataset.ContextualAudioToBPEDataset
+    manifest_filepath: "???" # Needs to be filled by user
+    sample_rate: ${model.sample_rate}
+    batch_size: 16
+    shuffle: true
+    num_workers: 8
+    pin_memory: true
+    max_duration: 16.7
+    min_duration: 0.1
+    prev_text_field: "prev_text" # Field for previous text in manifest
+    # tarred datasets (optional)
+    is_tarred: false
+    tarred_audio_filepaths: null # Or list of paths to tar files
+    shuffle_n: 2048
+    # bucketing params (optional)
+    bucketing_strategy: "fully_randomized"
+    bucketing_batch_size: null # or specific batch sizes if bucketing_strategy involves it
+
+  validation_ds:
+    _target_: nemo.collections.asr.data.contextual_audio_to_text_dataset.ContextualAudioToBPEDataset
+    manifest_filepath: "???" # Needs to be filled by user
+    sample_rate: ${model.sample_rate}
+    batch_size: 16
+    shuffle: false
+    use_start_end_token: false # For BPE transducer
+    num_workers: 8
+    pin_memory: true
+    prev_text_field: "prev_text"
+
+  test_ds:
+    _target_: nemo.collections.asr.data.contextual_audio_to_text_dataset.ContextualAudioToBPEDataset
+    manifest_filepath: null # Needs to be filled by user, or keep null
+    sample_rate: ${model.sample_rate}
+    batch_size: 16
+    shuffle: false
+    use_start_end_token: false
+    num_workers: 8
+    pin_memory: true
+    prev_text_field: "prev_text"
+
+  tokenizer:
+    dir: "???" # Path to SentencePiece BPE tokenizer model directory (e.g., containing tokenizer.model)
+    type: "bpe"
+
+  preprocessor:
+    _target_: nemo.collections.asr.modules.AudioToMelSpectrogramPreprocessor
+    sample_rate: ${model.sample_rate}
+    normalize: "per_feature"
+    window_size: 0.025
+    window_stride: 0.01
+    window: "hann"
+    features: 80
+    n_fft: 512
+    frame_splicing: 1
+    dither: 0.00001
+    pad_to: 0
+
+  spec_augment:
+    _target_: nemo.collections.asr.modules.SpectrogramAugmentation
+    freq_masks: 2
+    time_masks: 10
+    freq_width: 27
+    time_width: 0.05
+
+  encoder: # FastConformer Large settings
+    _target_: nemo.collections.asr.modules.ConformerEncoder
+    feat_in: ${model.preprocessor.features}
+    feat_out: -1
+    n_layers: 17
+    d_model: 512
+    subsampling: dw_striding
+    subsampling_factor: 8
+    subsampling_conv_channels: 256
+    causal_downsampling: false
+    reduction: null
+    reduction_position: null
+    reduction_factor: 1
+    ff_expansion_factor: 4
+    self_attention_model: rel_pos
+    n_heads: 8
+    att_context_size: [-1, -1]
+    att_context_style: regular
+    xscaling: true
+    untie_biases: true
+    pos_emb_max_len: 5000
+    use_pytorch_sdpa: false
+    use_pytorch_sdpa_backends: []
+    conv_kernel_size: 9
+    conv_norm_type: 'batch_norm'
+    conv_context_size: null
+    dropout: 0.1
+    dropout_pre_encoder: 0.1
+    dropout_emb: 0.0
+    dropout_att: 0.1
+    stochastic_depth_drop_prob: 0.0
+    stochastic_depth_mode: linear
+    stochastic_depth_start_layer: 1
+
+  text_context_encoder: # New section for the text encoder
+    _target_: nemo.collections.asr.modules.contextual_encoders.SimpleTextContextEncoder
+    # vocab_size: ??? # Will be set by ContextualEncDecRNNTModel.__init__
+    embedding_dim: 256  # Example: Dimension of text token embeddings
+    hidden_size: 256    # Example: d_model for the Transformer in text encoder
+    num_layers: 2       # Example: Number of Transformer layers for text
+    num_attention_heads: 4 # Example: Attention heads for text Transformer
+    ff_expansion_factor: 4 # Example
+    dropout: 0.1        # Example
+
+  contextual_fusion_module: # New section for the fusion module
+    _target_: nemo.collections.asr.modules.contextual_encoders.ContextualFusionModule
+    # audio_d_model will be set from model.encoder.d_model (e.g., 512)
+    # text_context_d_model will be set from model.text_context_encoder.hidden_size (e.g., 256)
+    # Note: The ContextualFusionModule has internal projections if these dimensions differ.
+    num_attention_heads: 8 # Example: Attention heads for fusion (should align with audio_d_model if possible)
+    dropout: 0.1           # Example
+
+  decoder: # Standard FastConformer Large settings
+    _target_: nemo.collections.asr.modules.RNNTDecoder
+    normalization_mode: null
+    random_state_sampling: false
+    blank_as_pad: true
+    prednet:
+      pred_hidden: ${model.model_defaults.pred_hidden} # 640
+      pred_rnn_layers: 1
+      t_max: null
+      dropout: 0.2
+
+  joint: # Standard FastConformer Large settings
+    _target_: nemo.collections.asr.modules.RNNTJoint
+    log_softmax: null
+    preserve_memory: false
+    fuse_loss_wer: true # Recommended for RNNT for memory efficiency
+    fused_batch_size: 4 # Can be tuned based on memory/speed trade-off
+    jointnet:
+      joint_hidden: ${model.model_defaults.joint_hidden} # 640
+      activation: "relu"
+      dropout: 0.2
+
+  decoding:
+    strategy: "greedy_batch"
+    greedy:
+      max_symbols: 10
+    beam: # Beam search settings (if strategy is 'beam', 'tsd', or 'alsd')
+      beam_size: 2
+      return_best_hypothesis: False # Set to True if only the best is needed
+      score_norm: true
+      tsd_max_sym_exp: 50
+      alsd_max_target_len: 2.0
+
+  loss:
+    loss_name: "default" # Uses default RNNT loss (warprnnt_numba if available, else warprnnt_pytorch)
+    warprnnt_numba_kwargs:
+      fastemit_lambda: 0.0
+      clamp: -1.0
+
+  optim:
+    name: adamw
+    lr: 5e-3 # May need adjustment
+    betas: [0.9, 0.98]
+    weight_decay: 1e-3
+    sched:
+      name: CosineAnnealing
+      warmup_steps: 15000 # May need adjustment based on dataset size
+      warmup_ratio: null
+      min_lr: 5e-4 # May need adjustment
+
+trainer: # Standard trainer config
+  devices: -1
+  num_nodes: 1
+  max_epochs: 500
+  max_steps: -1
+  val_check_interval: 1.0
+  accelerator: auto
+  strategy: ddp # Replaced _target_ with direct ddp for newer PTL
+  accumulate_grad_batches: 1
+  gradient_clip_val: 0.0
+  precision: 32 # bf16 or 16 recommended for speed if supported and stable
+  log_every_n_steps: 10
+  enable_progress_bar: True
+  num_sanity_val_steps: 0
+  check_val_every_n_epoch: 1
+  sync_batchnorm: true
+  enable_checkpointing: False  # Provided by exp_manager
+  logger: False  # Provided by exp_manager
+  benchmark: false
+
+exp_manager: # Standard experiment manager config
+  exp_dir: null # Output directory, needs to be set by user
+  name: ${name}
+  create_tensorboard_logger: true
+  create_checkpoint_callback: true
+  checkpoint_callback_params:
+    monitor: "val_wer" # This will depend on validation_step correctly logging 'val_wer'
+    mode: "min"
+    save_top_k: 5
+    always_save_nemo: True
+  resume_from_checkpoint: null
+  resume_if_exists: false
+  resume_ignore_no_checkpoint: false
+  create_wandb_logger: false
+  wandb_logger_kwargs:
+    name: null
+    project: null
