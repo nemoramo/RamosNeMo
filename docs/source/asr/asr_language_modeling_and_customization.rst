@@ -10,6 +10,19 @@ Language models have shown to help the accuracy of ASR models. NeMo supports the
 It is possible to use both approaches on the same ASR model.
 
 
+.. _context_aware_asr_intro:
+
+************************************************
+Context-Aware ASR (Previous Utterance Context)
+************************************************
+
+Beyond language modeling and rescoring, another method to enhance ASR performance is by making the acoustic model itself aware of the preceding conversation.
+NeMo supports a mechanism to feed the transcript of the previous utterance as textual context directly into the FastConformer model.
+This can help in resolving ambiguities and improving the recognition of terms or entities that were mentioned recently.
+
+For detailed information on how to use this feature, including manifest preparation, model configuration, and example scripts, please refer to the :doc:`Context-Aware ASR with FastConformer <contextual_asr>` documentation.
+
+
 .. _ngram_modeling:
 
 ************************
