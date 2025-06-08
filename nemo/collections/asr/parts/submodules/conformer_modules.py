@@ -79,6 +79,7 @@ class ConformerLayer(torch.nn.Module, AttentionAdapterModuleMixin, AccessMixin):
         use_bias=True,
         use_pytorch_sdpa=False,
         use_pytorch_sdpa_backends=None,
+        cross_attention_model='abs_pos',  # Add new argument
     ):
         super(ConformerLayer, self).__init__()
 
@@ -87,6 +88,7 @@ class ConformerLayer(torch.nn.Module, AttentionAdapterModuleMixin, AccessMixin):
             use_pytorch_sdpa_backends = []
         self.use_pytorch_sdpa_backends = use_pytorch_sdpa_backends
         self.self_attention_model = self_attention_model
+        self.cross_attention_model = cross_attention_model  # Store the model type
         self.n_heads = n_heads
         self.fc_factor = 0.5
 
@@ -103,6 +105,21 @@ class ConformerLayer(torch.nn.Module, AttentionAdapterModuleMixin, AccessMixin):
             conv_context_size=conv_context_size,
             use_bias=use_bias,
         )
+
+        # Cross-attention module (if applicable)
+        if self.cross_attention_model == 'abs_pos':
+            self.norm_cross_attn = LayerNorm(d_model)
+            self.cross_attn = MultiHeadAttention(
+                n_head=n_heads,
+                n_feat=d_model,
+                dropout_rate=dropout_att,
+                use_bias=use_bias,
+                # max_cache_len can be set if caching is needed for cross-attention
+            )
+        elif self.cross_attention_model is not None:
+            raise ValueError(
+                f"Unsupported cross_attention_model: {self.cross_attention_model}. Currently only 'abs_pos' is supported."
+            )
 
         # multi-headed self-attention module
         self.norm_self_att = LayerNorm(d_model)
@@ -157,7 +174,7 @@ class ConformerLayer(torch.nn.Module, AttentionAdapterModuleMixin, AccessMixin):
         self.dropout = nn.Dropout(dropout)
         self.norm_out = LayerNorm(d_model)
 
-    def forward(self, x, att_mask=None, pos_emb=None, pad_mask=None, cache_last_channel=None, cache_last_time=None):
+    def forward(self, x, att_mask=None, pos_emb=None, pad_mask=None, cache_last_channel=None, cache_last_time=None, text_context_embedding=None):
         """
         Args:
             x (torch.Tensor): input signals (B, T, d_model)
@@ -207,6 +224,15 @@ class ConformerLayer(torch.nn.Module, AttentionAdapterModuleMixin, AccessMixin):
         if cache_last_time is not None:
             (x, cache_last_time) = x
         residual = residual + self.dropout(x)
+
+        # Cross-attention block
+        if text_context_embedding is not None and self.cross_attention_model == 'abs_pos':
+            cross_attn_input = self.norm_cross_attn(residual)
+            # Assuming cross_attn does not use pos_emb and cache for now
+            # Also, mask for cross-attention might be different or not needed, depending on use case.
+            # Here, we pass `None` as mask.
+            cross_attn_out = self.cross_attn(query=cross_attn_input, key=text_context_embedding, value=text_context_embedding, mask=None)
+            residual = residual + self.dropout(cross_attn_out)
 
         x = self.norm_feed_forward2(residual)
         x = self.feed_forward2(x)

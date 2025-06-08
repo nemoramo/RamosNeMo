@@ -47,6 +47,11 @@ from nemo.collections.common import tokenizers
 from nemo.collections.common.data.lhotse import get_lhotse_dataloader_from_config
 from nemo.utils import logging
 
+# For dataset tests with context
+from nemo.collections.asr.data.audio_to_text import AudioToBPEDataset, TarredAudioToBPEDataset
+from nemo.collections.common.tokenizers import SentencePieceTokenizer
+
+
 try:
     HAVE_DALI = is_dali_supported(__DALI_MINIMUM_VERSION__)
 except (ImportError, ModuleNotFoundError):
@@ -861,3 +866,297 @@ class TestUtilityFunctions:
             for f_store in store_files_to_compare:
                 f_cache = os.path.join(test_cache_dir, os.path.relpath(f_store, test_store_dir))
                 assert filecmp.cmp(f_store, f_cache, shallow=False), f'Files {f_store} and {f_cache} do not match.'
+
+
+class TestAudioToBPEDatasetWithContext:
+    def setup_method(self):
+        self.temp_dir = tempfile.mkdtemp()
+        # Create a dummy tokenizer model file for SentencePieceTokenizer
+        self.dummy_tokenizer_model_path = os.path.join(self.temp_dir, "dummy_tokenizer.model")
+        with open(self.dummy_tokenizer_model_path, "w") as f:
+            f.write("\0\0\0\0") # Minimal content to make it a valid file for SP
+
+        # Create a dummy vocab file (not strictly needed by SP model path but good for completeness)
+        dummy_vocab_path = os.path.join(self.temp_dir, "vocab.txt")
+        with open(dummy_vocab_path, "w") as f:
+            f.write("<unk>\n<s>\n</s>\nhello\nworld\n nemo\n") # Sample tokens
+
+        # Instantiate SentencePieceTokenizer
+        # Note: SentencePiece actual model training is complex. We use a dummy model path.
+        # For testing tokenization, we might need to mock text_to_ids or use a real simple model.
+        # For this test, we'll assume text_to_ids works and returns some sequence of integers.
+        # A more robust test would involve creating a minimal valid SP model.
+        # For now, we'll use a mock for text_to_ids to control its output.
+        self.tokenizer = SentencePieceTokenizer(model_path=self.dummy_tokenizer_model_path)
+
+        # Mocking text_to_ids for predictable behavior
+        def mock_text_to_ids(text):
+            if text == "world":
+                return [4, 5, 6] # Example IDs for "world"
+            elif text == "context one":
+                return [7, 8, 9, 10]
+            elif text == "hello":
+                return [1,2,3]
+            elif text == "":
+                return []
+            else: # Fallback for other texts if any
+                return [hash(char) % 100 for char in text] # Simple hashing for other strings
+
+        self.tokenizer.text_to_ids = mock.MagicMock(side_effect=mock_text_to_ids)
+        # Mock ids_to_text for completeness if needed, though not used in these tests directly
+        self.tokenizer.ids_to_text = mock.MagicMock(return_value="mocked text")
+
+
+    def teardown_method(self):
+        shutil.rmtree(self.temp_dir)
+
+    def _create_manifest(self, data, name_suffix=""):
+        manifest_path = os.path.join(self.temp_dir, f"manifest{name_suffix}.json")
+        with open(manifest_path, "w") as f:
+            for entry in data:
+                f.write(json.dumps(entry) + "\n")
+        return manifest_path
+
+    @pytest.mark.unit
+    def test_getitem_with_context(self):
+        manifest_data = [{"audio_filepath": "dummy.wav", "duration": 1.0, "text": "hello", "text_context": "world"}]
+        manifest_path = self._create_manifest(manifest_data)
+
+        dataset = AudioToBPEDataset(manifest_filepath=manifest_path, tokenizer=self.tokenizer, sample_rate=16000)
+
+        # __getitem__ returns: features, feat_len, tokens, tokens_len, text_context_ids, text_context_len
+        # (assuming return_sample_id is False by default)
+        sample = dataset[0]
+
+        assert len(sample) == 6
+        # sample[-2] is text_context_ids, sample[-1] is text_context_length
+        expected_context_ids = torch.tensor(self.tokenizer.text_to_ids("world")).long()
+        torch.testing.assert_close(sample[-2], expected_context_ids)
+        torch.testing.assert_close(sample[-1], torch.tensor(len(expected_context_ids)).long())
+
+    @pytest.mark.unit
+    def test_getitem_without_context(self):
+        manifest_data = [{"audio_filepath": "dummy.wav", "duration": 1.0, "text": "hello"}] # No text_context
+        manifest_path = self._create_manifest(manifest_data)
+        dataset = AudioToBPEDataset(manifest_filepath=manifest_path, tokenizer=self.tokenizer, sample_rate=16000)
+
+        sample = dataset[0]
+        assert len(sample) == 6
+        torch.testing.assert_close(sample[-2], torch.tensor([]).long()) # Empty IDs
+        torch.testing.assert_close(sample[-1], torch.tensor(0).long())  # Length 0
+
+    @pytest.mark.unit
+    def test_getitem_mixed_context(self):
+        manifest_data = [
+            {"audio_filepath": "d1.wav", "duration": 1.0, "text": "h1", "text_context": "world"},
+            {"audio_filepath": "d2.wav", "duration": 1.0, "text": "h2"}, # No context
+            {"audio_filepath": "d3.wav", "duration": 1.0, "text": "h3", "text_context": ""}, # Empty context string
+        ]
+        manifest_path = self._create_manifest(manifest_data)
+        dataset = AudioToBPEDataset(manifest_filepath=manifest_path, tokenizer=self.tokenizer, sample_rate=16000)
+
+        # Sample 1 (with context)
+        sample1 = dataset[0]
+        expected_context_ids1 = torch.tensor(self.tokenizer.text_to_ids("world")).long()
+        torch.testing.assert_close(sample1[-2], expected_context_ids1)
+        torch.testing.assert_close(sample1[-1], torch.tensor(len(expected_context_ids1)).long())
+
+        # Sample 2 (no context field)
+        sample2 = dataset[1]
+        torch.testing.assert_close(sample2[-2], torch.tensor([]).long())
+        torch.testing.assert_close(sample2[-1], torch.tensor(0).long())
+
+        # Sample 3 (empty context string)
+        sample3 = dataset[2]
+        torch.testing.assert_close(sample3[-2], torch.tensor([]).long())
+        torch.testing.assert_close(sample3[-1], torch.tensor(0).long())
+
+    @pytest.mark.unit
+    def test_collate_fn_with_context(self):
+        # Dummy tensors for audio and main transcript parts for simplicity
+        # Format: (audio_signal, audio_length, transcript_tokens, transcript_length, text_context_ids, text_context_length)
+        # Note: actual audio/transcript parts are not deeply inspected by this specific collate logic for text_context part
+
+        audio_len1, trans_len1 = 10, 5
+        ctx_ids1 = torch.tensor(self.tokenizer.text_to_ids("world")).long()
+        ctx_len1 = torch.tensor(len(ctx_ids1)).long()
+        sample1 = (torch.randn(audio_len1), torch.tensor(audio_len1), torch.randint(0,10,(trans_len1,)), torch.tensor(trans_len1), ctx_ids1, ctx_len1)
+
+        audio_len2, trans_len2 = 8, 3
+        ctx_ids2 = torch.tensor(self.tokenizer.text_to_ids("context one")).long() # longer context
+        ctx_len2 = torch.tensor(len(ctx_ids2)).long()
+        sample2 = (torch.randn(audio_len2), torch.tensor(audio_len2), torch.randint(0,10,(trans_len2,)), torch.tensor(trans_len2), ctx_ids2, ctx_len2)
+
+        audio_len3, trans_len3 = 12, 6
+        ctx_ids3 = torch.tensor([]).long() # no context
+        ctx_len3 = torch.tensor(0).long()
+        sample3 = (torch.randn(audio_len3), torch.tensor(audio_len3), torch.randint(0,10,(trans_len3,)), torch.tensor(trans_len3), ctx_ids3, ctx_len3)
+
+        batch = [sample1, sample2, sample3]
+
+        # pad_id for main transcript, text_pad_id for text_context
+        # Assuming self.tokenizer.pad_id is 0 for main transcript for this test call.
+        # AudioToBPEDataset._collate_fn_with_text_context is a static method
+        collated_batch = AudioToBPEDataset._collate_fn_with_text_context(batch, pad_id=0, text_pad_id=0)
+
+        # Expected number of items in collated batch: 6 (audio, audio_len, trans, trans_len, text_ctx, text_ctx_len)
+        assert len(collated_batch) == 6
+
+        text_context_batch = collated_batch[-2]
+        text_context_lengths_batch = collated_batch[-1]
+
+        assert text_context_batch.ndim == 2
+        assert text_context_batch.shape[0] == len(batch) # Batch size
+        max_ctx_len = max(len(ctx_ids1), len(ctx_ids2), len(ctx_ids3))
+        assert text_context_batch.shape[1] == max_ctx_len # Max length of text_context in batch
+
+        torch.testing.assert_close(text_context_lengths_batch, torch.tensor([len(ctx_ids1), len(ctx_ids2), len(ctx_ids3)]).long())
+
+        # Check padding value (should be 0 for text_pad_id=0)
+        # Sample 1: ctx_ids1, padded to max_ctx_len
+        expected_s1_padded = torch.cat([ctx_ids1, torch.zeros(max_ctx_len - len(ctx_ids1), dtype=torch.long)])
+        torch.testing.assert_close(text_context_batch[0], expected_s1_padded)
+
+        # Sample 2: ctx_ids2 (already max length if it was the longest)
+        expected_s2_padded = torch.cat([ctx_ids2, torch.zeros(max_ctx_len - len(ctx_ids2), dtype=torch.long)])
+        torch.testing.assert_close(text_context_batch[1], expected_s2_padded)
+
+        # Sample 3: empty, padded to max_ctx_len with zeros
+        expected_s3_padded = torch.zeros(max_ctx_len, dtype=torch.long)
+        torch.testing.assert_close(text_context_batch[2], expected_s3_padded)
+
+    @pytest.mark.unit
+    def test_collate_fn_all_empty_context(self):
+        batch_size = 3
+        batch = []
+        for i in range(batch_size):
+            sample = (
+                torch.randn(10), torch.tensor(10), torch.randint(0,10,(5,)), torch.tensor(5),
+                torch.tensor([]).long(), torch.tensor(0).long() # Empty text context
+            )
+            batch.append(sample)
+
+        collated_batch = AudioToBPEDataset._collate_fn_with_text_context(batch, pad_id=0, text_pad_id=0)
+
+        text_context_batch = collated_batch[-2]
+        text_context_lengths_batch = collated_batch[-1]
+
+        assert text_context_batch.shape == (batch_size, 0) # (B, 0)
+        assert torch.all(text_context_lengths_batch == 0).item()
+
+
+# Note: TarredAudioToBPEDataset tests for context awareness would be more complex due to tar file handling.
+# A simplified test focusing on the _build_sample logic if it can be isolated or
+# by mocking the tar reading part could be added.
+# For now, focusing on AudioToBPEDataset as per the prompt's emphasis.
+# If TarredAudioToBPEDataset._collate_fn_with_text_context is identical, its direct test might be redundant
+# if AudioToBPEDataset._collate_fn_with_text_context is thoroughly tested.
+# However, testing the _build_sample part of TarredAudioToBPEDataset is important.
+
+class TestTarredAudioToBPEDatasetWithContext:
+    def setup_method(self):
+        self.temp_dir = tempfile.mkdtemp()
+        self.dummy_tokenizer_model_path = os.path.join(self.temp_dir, "dummy_tokenizer.model")
+        with open(self.dummy_tokenizer_model_path, "w") as f:
+            f.write("\0\0\0\0")
+
+        self.tokenizer = SentencePieceTokenizer(model_path=self.dummy_tokenizer_model_path)
+
+        def mock_text_to_ids(text):
+            if text == "tarred context":
+                return [10, 11, 12]
+            elif text == "hello":
+                 return [1,2,3]
+            elif text == "":
+                return []
+            else:
+                return [hash(char) % 100 for char in text]
+
+        self.tokenizer.text_to_ids = mock.MagicMock(side_effect=mock_text_to_ids)
+        self.tokenizer.pad_id = 0 # Assuming pad_id is 0 for this tokenizer for main transcript
+
+    def teardown_method(self):
+        shutil.rmtree(self.temp_dir)
+
+    @pytest.mark.unit
+    @mock.patch('soundfile.read') # Mock soundfile.read to avoid actual audio file operations
+    @mock.patch('nemo.collections.asr.data.audio_to_text.io.BytesIO') # Mock BytesIO
+    def test_tarred_build_sample_with_context(self, mock_bytes_io, mock_sf_read):
+        # Mock what soundfile.read would return: audio_data, sample_rate
+        mock_sf_read.return_value = (np.random.randn(16000).astype(np.float32), 16000)
+        # Mock BytesIO instance to have a close method
+        mock_bytes_io_instance = mock.MagicMock()
+        mock_bytes_io.return_value = mock_bytes_io_instance
+
+        # Create a dummy manifest file string that _TarredAudioToTextDataset's ASRManifestProcessor would load
+        manifest_lines_data = [
+            {"audio_filepath": "dummy1.wav", "duration": 1.0, "text": "hello", "text_context": "tarred context"},
+            {"audio_filepath": "dummy2.wav", "duration": 1.0, "text": "hello"} # No context
+        ]
+        manifest_content = "\n".join([json.dumps(line) for line in manifest_lines_data])
+
+        # Mock the manifest processor and its collection/manifest attributes sufficiently for _build_sample
+        mock_manifest_processor = mock.MagicMock()
+        mock_manifest_processor.collection = mock.MagicMock()
+        mock_manifest_processor.collection.manifest = mock.MagicMock()
+        mock_manifest_processor.collection.manifest.lines = [json.dumps(line) for line in manifest_lines_data]
+
+        # Mock collection[manifest_idx] to return a mock object that has necessary attributes
+        # and text_tokens (processed main transcript)
+        def get_collection_item(idx):
+            entry = mock.MagicMock()
+            entry.offset = 0
+            entry.duration = 1.0
+            entry.orig_sr = 16000
+            # Simulate processed text_tokens (main transcript) by ASRManifestProcessor
+            # For simplicity, assume bos/eos are not added here or handled by tokenizer itself in text_to_ids
+            entry.text_tokens = self.tokenizer.text_to_ids(manifest_lines_data[idx]["text"])
+            return entry
+
+        mock_manifest_processor.collection.__getitem__.side_effect = get_collection_item
+        # Mock the mapping from file_id to manifest_idx
+        mock_manifest_processor.collection.mapping = {
+            "dummy1": [0], # file_id "dummy1" maps to manifest_idx 0
+            "dummy2": [1], # file_id "dummy2" maps to manifest_idx 1
+        }
+
+
+        # Instantiate TarredAudioToBPEDataset - many args are for WebDataset pipeline which we are bypassing for _build_sample
+        # We need to ensure self.tokenizer and self.manifest_processor are set up.
+        dataset = TarredAudioToBPEDataset(
+            audio_tar_filepaths="dummy.tar", # Not actually used due to mocking
+            manifest_filepath="dummy.json",  # Not actually used due to mocking
+            tokenizer=self.tokenizer,
+            sample_rate=16000
+        )
+        # Replace manifest_processor with our mock
+        dataset.manifest_processor = mock_manifest_processor
+        # Ensure bos/eos/pad for _TarredAudioToTextDataset are set (used in _build_sample)
+        dataset.bos_id = None
+        dataset.eos_id = None
+        # dataset.pad_id is set by parent from tokenizer, if available, else 0. Our mock tokenizer has pad_id=0.
+
+        # Test sample 1 (with context)
+        # _build_sample takes (audio_bytes, audio_filename, offset_id)
+        # audio_bytes are passed to BytesIO, audio_filename is used for file_id
+        sample1_tuple = dataset._build_sample((b"dummy_audio_bytes", "dummy1.wav", 0))
+
+        assert len(sample1_tuple) == 6 # f, fl, t, tl, ctx_ids, ctx_len
+        expected_context_ids1 = torch.tensor(self.tokenizer.text_to_ids("tarred context")).long()
+        torch.testing.assert_close(sample1_tuple[-2], expected_context_ids1)
+        torch.testing.assert_close(sample1_tuple[-1], torch.tensor(len(expected_context_ids1)).long())
+
+        # Test sample 2 (without context)
+        sample2_tuple = dataset._build_sample((b"dummy_audio_bytes", "dummy2.wav", 0))
+        assert len(sample2_tuple) == 6
+        torch.testing.assert_close(sample2_tuple[-2], torch.tensor([]).long())
+        torch.testing.assert_close(sample2_tuple[-1], torch.tensor(0).long())
+
+        # Test the collate function (it's static and shared logic, so this is a good check)
+        collated_batch = TarredAudioToBPEDataset._collate_fn_with_text_context(
+            [sample1_tuple, sample2_tuple], pad_id=self.tokenizer.pad_id, text_pad_id=0
+        )
+        assert len(collated_batch) == 6
+        text_context_batch = collated_batch[-2]
+        assert text_context_batch.shape[1] == len(expected_context_ids1) # Max length from "tarred context"
+        torch.testing.assert_close(text_context_batch[1], torch.zeros_like(expected_context_ids1)) # Second sample was empty context

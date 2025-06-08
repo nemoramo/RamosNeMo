@@ -20,9 +20,11 @@ from lhotse.testing.dummies import DummyManifest
 from omegaconf import DictConfig, OmegaConf, open_dict
 
 import nemo.collections.asr as nemo_asr
+import tempfile # Added for dummy tokenizer file
+import os # Added for dummy tokenizer file
 from nemo.collections.asr.data import audio_to_text
 from nemo.collections.asr.data.audio_to_text_lhotse import LhotseSpeechToTextBpeDataset
-from nemo.collections.asr.models import EncDecCTCModel, configs
+from nemo.collections.asr.models import EncDecCTCModel, EncDecCTCModelBPE, configs # Added EncDecCTCModelBPE
 from nemo.collections.asr.parts.submodules.ctc_decoding import CTCDecoding, CTCDecodingConfig
 from nemo.collections.asr.parts.utils.rnnt_utils import Hypothesis
 from nemo.collections.common.parts.preprocessing.parsers import make_parser
@@ -316,6 +318,115 @@ class TestEncDecCTCModel:
         assert signatures_match
         assert cls_subset is None
         assert dataclass_subset is None
+
+    @pytest.mark.unit
+    def test_EncDecCTCModelBPE_with_text_context(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # Create a dummy tokenizer model file
+            dummy_tokenizer_model_path = os.path.join(tmpdir, "dummy_tokenizer.model")
+            with open(dummy_tokenizer_model_path, "w") as f:
+                # SentencePiece model needs some minimal protobuf structure, but often even empty/minimal files work for instantiation if not fully used.
+                # For robustness, one might need a minimal valid SP model file.
+                # Here, we provide minimal bytes that might prevent outright file-not-found or empty file errors.
+                f.write("\0\0\0\0") # Minimal content
+
+            d_model = 32 # Smaller d_model for faster test
+            preprocessor_cfg = DictConfig({
+                '_target_': 'nemo.collections.asr.modules.AudioToMelSpectrogramPreprocessor',
+                'sample_rate': 16000,
+                'features': 64, # Should match encoder's feat_in
+                 # Add other minimal required preprocessor params if any
+                'normalize': "per_feature",
+                'window_size': 0.025,
+                'window_stride': 0.01,
+                'window': "hann",
+                'n_fft': 512,
+                'log': True,
+                'frame_splicing': 1,
+                'dither': 0.00001,
+                'pad_to': 0,
+            })
+            encoder_cfg = DictConfig({
+                '_target_': 'nemo.collections.asr.modules.ConformerEncoder',
+                'feat_in': 64, # from preprocessor.features
+                'n_layers': 1,
+                'd_model': d_model,
+                'ff_expansion_factor': 1,
+                'n_heads': 2,
+                'conv_kernel_size': 3,
+                'subsampling_factor': 1, # Simpler for length calculation if no subsampling
+                'text_vocab_size': 10,
+                'text_d_model': 16, # Internal text embedding dim
+                'cross_attention_model': 'abs_pos',
+            })
+            decoder_cfg = DictConfig({
+                '_target_': 'nemo.collections.asr.modules.ConvASRDecoder',
+                'feat_in': d_model, # from encoder.d_model
+                'num_classes': 28,
+                'vocabulary': list("abcdefghijklmnopqrstuvwxyz' "), # len 28
+            })
+            tokenizer_cfg = DictConfig({
+                '_target_': 'nemo.collections.common.tokenizers.SentencePieceTokenizer',
+                'model_path': dummy_tokenizer_model_path,
+            })
+
+            model_cfg = DictConfig({
+                'preprocessor': preprocessor_cfg,
+                'encoder': encoder_cfg,
+                'decoder': decoder_cfg,
+                'tokenizer': tokenizer_cfg,
+                # Add other minimal EncDecCTCModelBPE params if any (e.g. spec_augment)
+                'spec_augment': None,
+            })
+
+            # Ensure sample_rate is in model_cfg for dataset processing if it were to happen
+            model_cfg.sample_rate = 16000
+
+
+            model = EncDecCTCModelBPE(cfg=model_cfg)
+            model.eval()
+
+            batch_size = 2
+            audio_samples = 2048
+            text_seq_len = 15
+
+            input_signal = torch.randn(batch_size, audio_samples)
+            input_signal_length = torch.tensor([audio_samples, audio_samples // 2], dtype=torch.long)
+
+            text_context = torch.randint(0, model_cfg.encoder.text_vocab_size, (batch_size, text_seq_len))
+            text_context_length = torch.tensor([text_seq_len, text_seq_len // 2], dtype=torch.long)
+
+            # Forward pass with context
+            log_probs_ctx, encoded_len_ctx, _ = model(
+                input_signal=input_signal.clone(),
+                input_signal_length=input_signal_length.clone(),
+                text_context=text_context.clone(),
+                text_context_length=text_context_length.clone()
+            )
+
+            assert log_probs_ctx.shape[0] == batch_size
+            assert log_probs_ctx.shape[2] == model_cfg.decoder.num_classes + 1 # num_classes + blank
+            assert encoded_len_ctx.shape[0] == batch_size
+            # Check if encoded lengths are plausible (depends on conv strides in preprocessor & encoder subsampling)
+            # For simplicity, with subsampling_factor=1 in encoder and default preprocessor,
+            # output length should be related to input length after STFT.
+            # Example: if STFT window_stride=0.01, sample_rate=16000 -> 10ms per frame. 2048 samples -> ~128 frames.
+            # This calculation can be complex, so primarily checking consistency and for errors.
+
+            # Forward pass without context
+            log_probs_no_ctx, encoded_len_no_ctx, _ = model(
+                input_signal=input_signal.clone(),
+                input_signal_length=input_signal_length.clone(),
+                text_context=None,
+                text_context_length=None
+            )
+
+            assert log_probs_no_ctx.shape == log_probs_ctx.shape
+            torch.testing.assert_close(encoded_len_no_ctx, encoded_len_ctx) # Lengths should be identical
+
+            # Outputs should differ due to context
+            assert not torch.allclose(log_probs_ctx, log_probs_no_ctx, atol=1e-5), \
+                "Logprobs with and without context should ideally be different."
 
     @pytest.mark.unit
     def test_ASRDatasetConfig_for_TarredAudioToCharDataset(self):

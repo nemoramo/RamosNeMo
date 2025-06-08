@@ -219,6 +219,165 @@ class TestBypassPreEncode:
         fwd_outputs = model(audio_signal=feat_input, length=input_length, bypass_pre_encode=False)[0]
         assert fwd_outputs.shape == (batch_size, feat_out, sub_sampled_n_frames)
 
+
+class TestConformerEncoderTextContext:
+    @pytest.mark.unit
+    def test_conformer_encoder_with_text_context(self):
+        batch_size = 4
+        feat_in = 80
+        audio_seq_len = 100
+        d_model = 64
+        text_vocab_size = 10
+        text_d_model_internal = 32 # Internal embedding dim for text before projection
+        text_seq_len = 20
+        subsampling_factor = 4 # Default for ConformerEncoder usually implies ConvSubsampling with factor 4
+
+        encoder = ConformerEncoder(
+            feat_in=feat_in,
+            n_layers=2,
+            d_model=d_model,
+            ff_expansion_factor=1, # Smaller for faster test
+            n_heads=2,
+            conv_kernel_size=3,
+            subsampling_factor=subsampling_factor, # Make it explicit
+            text_vocab_size=text_vocab_size,
+            text_d_model=text_d_model_internal,
+            cross_attention_model='abs_pos',
+        )
+        encoder.eval()
+
+        audio_signal = torch.randn(batch_size, feat_in, audio_seq_len)
+        # Lengths should be <= audio_seq_len
+        lengths = torch.randint(audio_seq_len // 2, audio_seq_len + 1, (batch_size,), dtype=torch.long)
+        lengths[0] = audio_seq_len # Ensure at least one max length sample for consistency
+
+        text_context = torch.randint(0, text_vocab_size, (batch_size, text_seq_len))
+
+        # Forward with text context
+        encoded_audio_ctx, encoded_len_ctx = encoder(
+            audio_signal=audio_signal.clone(), length=lengths.clone(), text_context=text_context.clone()
+        )
+
+        expected_encoded_len = torch.ceil(lengths.float() / subsampling_factor).long()
+        # Output shape: (B, D_model, T_encoded)
+        assert encoded_audio_ctx.shape[0] == batch_size
+        assert encoded_audio_ctx.shape[1] == d_model
+        # Max length of encoded audio, considering padding from other samples in batch
+        assert encoded_audio_ctx.shape[2] == expected_encoded_len.max().item()
+        torch.testing.assert_close(encoded_len_ctx, expected_encoded_len)
+
+
+        # Forward without text context
+        encoded_audio_no_ctx, encoded_len_no_ctx = encoder(
+            audio_signal=audio_signal.clone(), length=lengths.clone(), text_context=None
+        )
+        assert encoded_audio_no_ctx.shape == encoded_audio_ctx.shape
+        torch.testing.assert_close(encoded_len_no_ctx, encoded_len_ctx)
+
+        # Check that outputs are different
+        assert not torch.allclose(encoded_audio_ctx, encoded_audio_no_ctx, atol=1e-6)
+
+    @pytest.mark.unit
+    def test_conformer_encoder_no_text_encoder_with_context(self):
+        # Test behavior when text_context is provided but text embedding layers are not configured
+        batch_size = 2
+        feat_in = 80
+        audio_seq_len = 50
+        d_model = 32
+        text_seq_len = 10
+        subsampling_factor = 4
+
+        encoder = ConformerEncoder(
+            feat_in=feat_in, n_layers=1, d_model=d_model, subsampling_factor=subsampling_factor,
+            text_vocab_size=None, text_d_model=None # Text encoder parts not configured
+        )
+        encoder.eval()
+
+        audio_signal = torch.randn(batch_size, feat_in, audio_seq_len)
+        lengths = torch.tensor([audio_seq_len, audio_seq_len - 10], dtype=torch.long)
+        text_context = torch.randint(0, 10, (batch_size, text_seq_len)) # Dummy context
+
+        # Expect a warning to be logged (if logging.warning_once was used)
+        # For now, just check graceful execution and expected output shape
+        encoded_audio, encoded_len = encoder(
+            audio_signal=audio_signal, length=lengths, text_context=text_context
+        )
+
+        expected_encoded_len = torch.ceil(lengths.float() / subsampling_factor).long()
+        assert encoded_audio.shape[0] == batch_size
+        assert encoded_audio.shape[1] == d_model
+        assert encoded_audio.shape[2] == expected_encoded_len.max().item()
+        torch.testing.assert_close(encoded_len, expected_encoded_len)
+
+    @pytest.mark.unit
+    def test_conformer_encoder_text_embedding_passthrough(self):
+        from unittest.mock import patch
+
+        batch_size = 2
+        feat_in = 80
+        audio_seq_len = 50
+        d_model = 64
+        text_vocab_size = 10
+        text_d_model_internal = 32
+        text_seq_len = 10
+
+        encoder = ConformerEncoder(
+            feat_in=feat_in,
+            n_layers=1, # Test with one layer for simplicity
+            d_model=d_model,
+            text_vocab_size=text_vocab_size,
+            text_d_model=text_d_model_internal,
+            cross_attention_model='abs_pos',
+        )
+        encoder.eval()
+
+        audio_signal = torch.randn(batch_size, feat_in, audio_seq_len)
+        lengths = torch.tensor([audio_seq_len, audio_seq_len - 5], dtype=torch.long)
+        text_context = torch.randint(0, text_vocab_size, (batch_size, text_seq_len))
+
+        # Patch the forward method of the ConformerLayer(s)
+        # We target the actual layer instance within the encoder's ModuleList
+        assert len(encoder.layers) > 0, "Encoder should have at least one ConformerLayer"
+
+        # Path to the forward method of the first ConformerLayer
+        # The string should be 'module_instance_in_test.method_to_patch'
+        # Here, encoder.layers[0] is the instance.
+        with patch.object(encoder.layers[0], 'forward', wraps=encoder.layers[0].forward) as mock_layer_forward:
+            encoder(audio_signal=audio_signal.clone(), length=lengths.clone(), text_context=text_context.clone())
+
+            mock_layer_forward.assert_called()
+            # call_args is a tuple (args, kwargs) or CallArgs (args, kwargs) namedtuple
+            # We are interested in kwargs
+            called_kwargs = mock_layer_forward.call_args.kwargs
+            assert 'text_context_embedding' in called_kwargs
+            assert called_kwargs['text_context_embedding'] is not None
+            assert called_kwargs['text_context_embedding'].shape == (batch_size, text_seq_len, d_model)
+
+        # Test without text_context
+        with patch.object(encoder.layers[0], 'forward', wraps=encoder.layers[0].forward) as mock_layer_forward_no_ctx:
+            encoder(audio_signal=audio_signal.clone(), length=lengths.clone(), text_context=None)
+
+            mock_layer_forward_no_ctx.assert_called()
+            called_kwargs_no_ctx = mock_layer_forward_no_ctx.call_args.kwargs
+            assert 'text_context_embedding' in called_kwargs_no_ctx
+            assert called_kwargs_no_ctx['text_context_embedding'] is None
+
+    @pytest.mark.unit
+    def test_conformer_encoder_text_param_validation(self):
+        # Should raise ValueError if only one of text_vocab_size or text_d_model is provided
+        with pytest.raises(ValueError, match="Both text_vocab_size and text_d_model must be provided if one is."):
+            ConformerEncoder(feat_in=80, n_layers=1, d_model=64, text_vocab_size=10, text_d_model=None)
+
+        with pytest.raises(ValueError, match="Both text_vocab_size and text_d_model must be provided if one is."):
+            ConformerEncoder(feat_in=80, n_layers=1, d_model=64, text_vocab_size=None, text_d_model=32)
+
+        # Should work fine if both are provided or both are None
+        try:
+            ConformerEncoder(feat_in=80, n_layers=1, d_model=64, text_vocab_size=10, text_d_model=32)
+            ConformerEncoder(feat_in=80, n_layers=1, d_model=64, text_vocab_size=None, text_d_model=None)
+        except ValueError:
+            pytest.fail("ConformerEncoder instantiation failed unexpectedly for valid text_param configurations.")
+
         model.eval()
         fwd_outputs = model(audio_signal=feat_input, length=input_length, bypass_pre_encode=False)[0]
         assert fwd_outputs.shape == (batch_size, feat_out, sub_sampled_n_frames)

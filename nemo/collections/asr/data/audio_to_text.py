@@ -666,6 +666,8 @@ class AudioToBPEDataset(_AudioTextDataset):
         channel_selector: Optional[ChannelSelectorType] = None,
         manifest_parse_func: Optional[Callable] = None,
     ):
+        self.tokenizer = tokenizer  # Store tokenizer instance
+
         if use_start_end_token and hasattr(tokenizer, "bos_id") and tokenizer.bos_id > 0:
             bos_id = tokenizer.bos_id
         else:
@@ -681,27 +683,32 @@ class AudioToBPEDataset(_AudioTextDataset):
         else:
             pad_id = 0
 
-        class TokenizerWrapper:
-            def __init__(self, tokenizer):
-                if isinstance(tokenizer, tokenizers.aggregate_tokenizer.AggregateTokenizer):
+        # We now store self.tokenizer, so TokenizerWrapper for the parser can use it,
+        # or we can use self.tokenizer directly if the wrapper isn't essential for other functionalities.
+        # For ASRManifestProcessor, the parser is used to process text from manifest for `sample.text_tokens`.
+        # Since we are adding a new text field (text_context), we'll process it separately in __getitem__.
+        # The original text processing via parser for `sample.text` should remain unaffected.
+        class TokenizerWrapperForManifest:
+            def __init__(self, tokenizer_for_manifest):
+                if isinstance(tokenizer_for_manifest, tokenizers.aggregate_tokenizer.AggregateTokenizer):
                     self.is_aggregate = True
                 else:
                     self.is_aggregate = False
-                self._tokenizer = tokenizer
+                self._tokenizer = tokenizer_for_manifest
 
             def __call__(self, *args):
+                # This wrapper is for the main transcript text, not text_context
                 if isinstance(args[0], List) and self.is_aggregate:
-                    t = []
+                    t_main = []
                     for span in args[0]:
-                        t.extend(self._tokenizer.text_to_ids(span['str'], span['lang']))
-                    return t
-
-                t = self._tokenizer.text_to_ids(*args)
-                return t
+                        t_main.extend(self._tokenizer.text_to_ids(span['str'], span['lang']))
+                    return t_main
+                t_main = self._tokenizer.text_to_ids(*args)
+                return t_main
 
         super().__init__(
             manifest_filepath=manifest_filepath,
-            parser=TokenizerWrapper(tokenizer),
+            parser=TokenizerWrapperForManifest(tokenizer), # Pass the original tokenizer to the wrapper for manifest
             sample_rate=sample_rate,
             int_values=int_values,
             augmentor=augmentor,
@@ -716,6 +723,131 @@ class AudioToBPEDataset(_AudioTextDataset):
             channel_selector=channel_selector,
             manifest_parse_func=manifest_parse_func,
         )
+        # Override collate_fn to handle text_context
+        self.collate_fn = lambda batch: AudioToBPEDataset._collate_fn_with_text_context(
+            batch, pad_id=self.manifest_processor.pad_id, text_pad_id=0  # text_pad_id is 0 for text_context
+        )
+
+    def __getitem__(self, index):
+        # Get the original sample (audio, audio_len, transcript, transcript_len, optional_sample_id)
+        # The parent _AudioTextDataset's __getitem__ calls self._process_sample
+        # self._process_sample then calls self.manifest_processor.process_text_by_sample for main transcript
+        original_sample_data = super().__getitem__(index)
+
+        # Load text_context from manifest line
+        # self.manifest_processor.collection is ASRAudioText
+        # self.manifest_processor.collection.manifest is ManifestBase
+        # self.manifest_processor.collection.manifest.lines contains raw lines
+        raw_json_line = self.manifest_processor.collection.manifest.lines[index]
+        file_data = json.loads(raw_json_line)
+
+        text_context_str = file_data.get('text_context', "")
+        text_context_ids = self.tokenizer.text_to_ids(text_context_str)
+        text_context_length = len(text_context_ids)
+
+        return original_sample_data + (
+            torch.tensor(text_context_ids).long(),
+            torch.tensor(text_context_length).long(),
+        )
+
+    @staticmethod
+    def _collate_fn_with_text_context(batch, pad_id, text_pad_id=0):
+        """
+        Collate function for AudioToBPEDataset that also handles text_context.
+        """
+        num_items_per_sample = len(batch[0])
+        has_sample_id = False
+        if num_items_per_sample == 7: # audio, audio_len, tokens, tokens_len, sample_id, text_context_ids, text_context_len
+            has_sample_id = True
+        elif num_items_per_sample == 6: # audio, audio_len, tokens, tokens_len, text_context_ids, text_context_len
+            has_sample_id = False
+        else:
+            raise ValueError(f"Unexpected number of items per sample in batch: {num_items_per_sample}")
+
+        audio_lengths_list = [s[1] for s in batch]
+        tokens_lengths_list = [s[3] for s in batch]
+        text_context_lengths_list = [s[-1] for s in batch] # text_context_length is always the last item
+
+        max_audio_len = 0
+        has_audio = audio_lengths_list[0] is not None
+        if has_audio:
+            max_audio_len = max(audio_lengths_list).item()
+
+        has_tokens = tokens_lengths_list[0] is not None
+        if has_tokens:
+            max_tokens_len = max(tokens_lengths_list).item()
+
+        has_text_context = text_context_lengths_list[0] is not None # Assuming if one has it, all attempts were made
+        if has_text_context: # Max length for text_context_ids
+            max_text_context_len = 0
+            # Check if any text_context_ids actually exist, otherwise max_text_context_len remains 0
+            if any(l > 0 for l in text_context_lengths_list):
+                 max_text_context_len = max(l.item() for l in text_context_lengths_list if l.item() > 0)
+
+
+        audio_signal, tokens, text_context_ids_batch = [], [], []
+        sample_ids_list = []
+
+        for sample in batch:
+            audio_s, audio_l, tokens_s, tokens_l = sample[0], sample[1], sample[2], sample[3]
+            text_context_s, text_context_l = sample[-2], sample[-1] # text_context_ids, text_context_length
+
+            if has_audio:
+                sl = audio_l.item()
+                if sl < max_audio_len:
+                    pad = (0, max_audio_len - sl)
+                    audio_s = torch.nn.functional.pad(audio_s, pad)
+                audio_signal.append(audio_s)
+
+            if has_tokens:
+                tl = tokens_l.item()
+                if tl < max_tokens_len:
+                    pad = (0, max_tokens_len - tl)
+                    tokens_s = torch.nn.functional.pad(tokens_s, pad, value=pad_id)
+                tokens.append(tokens_s)
+
+            if has_text_context:
+                tcl = text_context_l.item()
+                if tcl < max_text_context_len:
+                    pad = (0, max_text_context_len - tcl)
+                    text_context_s = torch.nn.functional.pad(text_context_s, pad, value=text_pad_id)
+                elif tcl > max_text_context_len: # Should not happen if max_text_context_len is calculated correctly
+                     text_context_s = text_context_s[:max_text_context_len]
+                text_context_ids_batch.append(text_context_s)
+
+            if has_sample_id:
+                sample_ids_list.append(sample[4])
+
+        # Stack audio signals and their lengths
+        if has_audio:
+            audio_signal_batch = torch.stack(audio_signal)
+            audio_lengths_batch = torch.stack(audio_lengths_list)
+        else:
+            audio_signal_batch, audio_lengths_batch = None, None
+
+        # Stack tokens and their lengths
+        if has_tokens:
+            tokens_batch = torch.stack(tokens)
+            tokens_lengths_batch = torch.stack(tokens_lengths_list)
+        else:
+            tokens_batch, tokens_lengths_batch = None, None
+
+        # Stack text_context_ids and their lengths
+        if has_text_context and max_text_context_len > 0 :
+            text_context_final_batch = torch.stack(text_context_ids_batch)
+        elif has_text_context: # all text contexts were empty
+             text_context_final_batch = torch.empty(len(batch), 0, dtype=torch.long) # empty tensor with (B, 0)
+        else: # Should not be reached if has_text_context was true, but as a fallback
+            text_context_final_batch = None
+
+        text_context_lengths_final_batch = torch.stack(text_context_lengths_list) if has_text_context else None
+
+
+        if has_sample_id:
+            sample_ids_batch = torch.tensor(sample_ids_list, dtype=torch.int32)
+            return audio_signal_batch, audio_lengths_batch, tokens_batch, tokens_lengths_batch, sample_ids_batch, text_context_final_batch, text_context_lengths_final_batch
+        else:
+            return audio_signal_batch, audio_lengths_batch, tokens_batch, tokens_lengths_batch, text_context_final_batch, text_context_lengths_final_batch
 
 
 @deprecated(
@@ -1263,6 +1395,8 @@ class TarredAudioToBPEDataset(_TarredAudioToTextDataset):
         return_sample_id: bool = False,
         manifest_parse_func: Optional[Callable] = None,
     ):
+        self.tokenizer = tokenizer # Store tokenizer instance
+
         if use_start_end_token and hasattr(tokenizer, "bos_id") and tokenizer.bos_id > 0:
             bos_id = tokenizer.bos_id
         else:
@@ -1278,28 +1412,29 @@ class TarredAudioToBPEDataset(_TarredAudioToTextDataset):
         else:
             pad_id = 0
 
-        class TokenizerWrapper:
-            def __init__(self, tokenizer):
-                if isinstance(tokenizer, tokenizers.aggregate_tokenizer.AggregateTokenizer):
+        # Similar to AudioToBPEDataset, using a specific wrapper for the main transcript text
+        # and processing text_context separately in _build_sample.
+        class TokenizerWrapperForManifest:
+            def __init__(self, tokenizer_for_manifest):
+                if isinstance(tokenizer_for_manifest, tokenizers.aggregate_tokenizer.AggregateTokenizer):
                     self.is_aggregate = True
                 else:
                     self.is_aggregate = False
-                self._tokenizer = tokenizer
+                self._tokenizer = tokenizer_for_manifest
 
             def __call__(self, *args):
                 if isinstance(args[0], List) and self.is_aggregate:
-                    t = []
+                    t_main = []
                     for span in args[0]:
-                        t.extend(self._tokenizer.text_to_ids(span['str'], span['lang']))
-                    return t
-
-                t = self._tokenizer.text_to_ids(*args)
-                return t
+                        t_main.extend(self._tokenizer.text_to_ids(span['str'], span['lang']))
+                    return t_main
+                t_main = self._tokenizer.text_to_ids(*args)
+                return t_main
 
         super().__init__(
             audio_tar_filepaths=audio_tar_filepaths,
             manifest_filepath=manifest_filepath,
-            parser=TokenizerWrapper(tokenizer),
+            parser=TokenizerWrapperForManifest(tokenizer), # Pass the original tokenizer to the wrapper
             sample_rate=sample_rate,
             int_values=int_values,
             augmentor=augmentor,
@@ -1317,6 +1452,164 @@ class TarredAudioToBPEDataset(_TarredAudioToTextDataset):
             return_sample_id=return_sample_id,
             manifest_parse_func=manifest_parse_func,
         )
+        # Override collate_fn to handle text_context
+        # self.pad_id is inherited from _TarredAudioToTextDataset which gets it from manifest_processor
+        self.collate_fn = lambda batch: TarredAudioToBPEDataset._collate_fn_with_text_context(
+            batch, pad_id=self.pad_id, text_pad_id=0 # text_pad_id is 0 for text_context
+        )
+
+    def _build_sample(self, tup):
+        """Builds the training sample by combining the data from the WebDataset with the manifest info."""
+        audio_bytes, audio_filename, offset_id = tup
+
+        # Grab manifest entry from self.manifest_preprocessor.collection
+        file_id, _ = os.path.splitext(os.path.basename(audio_filename))
+
+        manifest_idx = self.manifest_processor.collection.mapping[file_id][offset_id]
+        manifest_entry = self.manifest_processor.collection[manifest_idx]
+
+        offset = manifest_entry.offset
+        if offset is None:
+            offset = 0
+
+        # Convert audio bytes to IO stream for processing (for SoundFile to read)
+        audio_filestream = io.BytesIO(audio_bytes)
+        features = self.featurizer.process(
+            audio_filestream,
+            offset=offset,
+            duration=manifest_entry.duration,
+            trim=self.trim,
+            orig_sr=manifest_entry.orig_sr,
+        )
+        audio_filestream.close()
+
+        # Audio features
+        f, fl = features, torch.tensor(features.shape[0]).long()
+
+        # Text features (main transcript)
+        t, tl = manifest_entry.text_tokens, len(manifest_entry.text_tokens)
+        # This part is already done by ASRManifestProcessor if parser is set up with bos/eos
+        # self.manifest_processor.process_text_by_sample(sample=manifest_entry)
+        # However, the bos/eos logic in _TarredAudioToTextDataset's _build_sample is explicit
+        # Replicating that for consistency if it differs from what ASRManifestProcessor does by default for text_tokens
+        if self.bos_id is not None: # self.bos_id is from parent _TarredAudioToTextDataset
+            t = [self.bos_id] + t
+            tl += 1
+        if self.eos_id is not None: # self.eos_id is from parent _TarredAudioToTextDataset
+            t = t + [self.eos_id]
+            tl += 1
+
+        # Load text_context from manifest line
+        raw_json_line = self.manifest_processor.collection.manifest.lines[manifest_idx]
+        file_data = json.loads(raw_json_line)
+
+        text_context_str = file_data.get('text_context', "")
+        text_context_ids = self.tokenizer.text_to_ids(text_context_str) # Using self.tokenizer stored in __init__
+        text_context_length = len(text_context_ids)
+
+        current_sample_elements = [f, fl, torch.tensor(t).long(), torch.tensor(tl).long()]
+        if self.return_sample_id:
+            current_sample_elements.append(manifest_idx)
+
+        current_sample_elements.extend([
+            torch.tensor(text_context_ids).long(),
+            torch.tensor(text_context_length).long(),
+        ])
+        return tuple(current_sample_elements)
+
+    @staticmethod
+    def _collate_fn_with_text_context(batch, pad_id, text_pad_id=0):
+        """
+        Collate function for TarredAudioToBPEDataset that also handles text_context.
+        This is identical to AudioToBPEDataset._collate_fn_with_text_context logic.
+        """
+        num_items_per_sample = len(batch[0])
+        has_sample_id = False
+        if num_items_per_sample == 7: # audio, audio_len, tokens, tokens_len, sample_id, text_context_ids, text_context_len
+            has_sample_id = True
+        elif num_items_per_sample == 6: # audio, audio_len, tokens, tokens_len, text_context_ids, text_context_len
+            has_sample_id = False
+        else:
+            raise ValueError(f"Unexpected number of items per sample in batch: {num_items_per_sample}")
+
+        audio_lengths_list = [s[1] for s in batch]
+        tokens_lengths_list = [s[3] for s in batch]
+        text_context_lengths_list = [s[-1] for s in batch]
+
+        max_audio_len = 0
+        has_audio = audio_lengths_list[0] is not None
+        if has_audio:
+            max_audio_len = max(audio_lengths_list).item()
+
+        has_tokens = tokens_lengths_list[0] is not None
+        if has_tokens:
+            max_tokens_len = max(tokens_lengths_list).item()
+
+        has_text_context = text_context_lengths_list[0] is not None
+        if has_text_context:
+            max_text_context_len = 0
+            if any(l > 0 for l in text_context_lengths_list):
+                 max_text_context_len = max(l.item() for l in text_context_lengths_list if l.item() > 0)
+
+        audio_signal, tokens, text_context_ids_batch = [], [], []
+        sample_ids_list = []
+
+        for sample in batch:
+            audio_s, audio_l, tokens_s, tokens_l = sample[0], sample[1], sample[2], sample[3]
+            text_context_s, text_context_l = sample[-2], sample[-1]
+
+            if has_audio:
+                sl = audio_l.item()
+                if sl < max_audio_len:
+                    pad = (0, max_audio_len - sl)
+                    audio_s = torch.nn.functional.pad(audio_s, pad)
+                audio_signal.append(audio_s)
+
+            if has_tokens:
+                tl = tokens_l.item()
+                if tl < max_tokens_len:
+                    pad = (0, max_tokens_len - tl)
+                    tokens_s = torch.nn.functional.pad(tokens_s, pad, value=pad_id)
+                tokens.append(tokens_s)
+
+            if has_text_context:
+                tcl = text_context_l.item()
+                if tcl < max_text_context_len:
+                    pad = (0, max_text_context_len - tcl)
+                    text_context_s = torch.nn.functional.pad(text_context_s, pad, value=text_pad_id)
+                elif tcl > max_text_context_len:
+                     text_context_s = text_context_s[:max_text_context_len]
+                text_context_ids_batch.append(text_context_s)
+
+            if has_sample_id:
+                sample_ids_list.append(sample[4])
+
+        if has_audio:
+            audio_signal_batch = torch.stack(audio_signal)
+            audio_lengths_batch = torch.stack(audio_lengths_list)
+        else:
+            audio_signal_batch, audio_lengths_batch = None, None
+
+        if has_tokens:
+            tokens_batch = torch.stack(tokens)
+            tokens_lengths_batch = torch.stack(tokens_lengths_list)
+        else:
+            tokens_batch, tokens_lengths_batch = None, None
+
+        if has_text_context and max_text_context_len > 0 :
+            text_context_final_batch = torch.stack(text_context_ids_batch)
+        elif has_text_context:
+             text_context_final_batch = torch.empty(len(batch), 0, dtype=torch.long)
+        else:
+            text_context_final_batch = None
+
+        text_context_lengths_final_batch = torch.stack(text_context_lengths_list) if has_text_context else None
+
+        if has_sample_id:
+            sample_ids_batch = torch.tensor(sample_ids_list, dtype=torch.int32)
+            return audio_signal_batch, audio_lengths_batch, tokens_batch, tokens_lengths_batch, sample_ids_batch, text_context_final_batch, text_context_lengths_final_batch
+        else:
+            return audio_signal_batch, audio_lengths_batch, tokens_batch, tokens_lengths_batch, text_context_final_batch, text_context_lengths_final_batch
 
 
 class BucketingDataset(IterableDataset):

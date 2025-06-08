@@ -225,6 +225,8 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
             {
                 "audio_signal": NeuralType(('B', 'D', 'T'), SpectrogramType()),
                 "length": NeuralType(tuple('B'), LengthsType()),
+                "text_context": NeuralType(('B', 'T'), TokenIndex(), optional=True),
+                "text_context_length": NeuralType(tuple('B'), LengthsType(), optional=True),
                 "cache_last_channel": NeuralType(('D', 'B', 'T', 'D'), ChannelType(), optional=True),
                 "cache_last_time": NeuralType(('D', 'B', 'D', 'T'), ChannelType(), optional=True),
                 "cache_last_channel_len": NeuralType(tuple('B'), LengthsType(), optional=True),
@@ -326,6 +328,10 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
         use_pytorch_sdpa: bool = False,
         use_pytorch_sdpa_backends=None,
         sync_max_audio_length: bool = True,
+        # Text context arguments
+        text_vocab_size: Optional[int] = None,
+        text_d_model: Optional[int] = None,
+        cross_attention_model: str = 'abs_pos',
     ):
         super().__init__()
         d_ff = d_model * ff_expansion_factor
@@ -345,6 +351,17 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
             use_pytorch_sdpa_backends = []
         self.use_pytorch_sdpa_backends = use_pytorch_sdpa_backends
         self.sync_max_audio_length = sync_max_audio_length
+        self.cross_attention_model = cross_attention_model
+
+        # Text embedding and projection
+        self.text_embedding = None
+        self.text_projection = None
+        if text_vocab_size is not None and text_d_model is not None:
+            self.text_embedding = nn.Embedding(text_vocab_size, text_d_model)
+            self.text_projection = nn.Linear(text_d_model, d_model)
+        elif text_vocab_size is not None or text_d_model is not None:
+            # Only one is provided, which is an invalid configuration
+            raise ValueError("Both text_vocab_size and text_d_model must be provided if one is.")
 
         # Setting up the att_context_size
         (
@@ -468,6 +485,7 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
                 use_bias=use_bias,
                 use_pytorch_sdpa=self.use_pytorch_sdpa,
                 use_pytorch_sdpa_backends=self.use_pytorch_sdpa_backends,
+                cross_attention_model=self.cross_attention_model,
             )
             self.layers.append(layer)
 
@@ -550,6 +568,8 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
         self,
         audio_signal,
         length,
+        text_context: Optional[torch.Tensor] = None,
+        # text_context_length: Optional[torch.Tensor] = None, # Currently not used but part of input_types
         cache_last_channel=None,
         cache_last_time=None,
         cache_last_channel_len=None,
@@ -586,6 +606,9 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
         return self.forward_internal(
             audio_signal,
             length,
+            audio_signal,
+            length,
+            text_context=text_context,
             cache_last_channel=cache_last_channel,
             cache_last_time=cache_last_time,
             cache_last_channel_len=cache_last_channel_len,
@@ -596,6 +619,7 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
         self,
         audio_signal,
         length,
+        text_context: Optional[torch.Tensor] = None,
         cache_last_channel=None,
         cache_last_time=None,
         cache_last_channel_len=None,
@@ -657,6 +681,16 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
 
         audio_signal, pos_emb = self.pos_enc(x=audio_signal, cache_len=cache_len)
 
+        # Process text context
+        text_context_embedding = None
+        if text_context is not None and self.text_embedding is not None and self.text_projection is not None:
+            text_context_embedding = self.text_embedding(text_context)
+            text_context_embedding = self.text_projection(text_context_embedding)
+        elif text_context is not None and (self.text_embedding is None or self.text_projection is None):
+            logging.warning_once(
+                "text_context was provided to ConformerEncoder, but text_embedding or text_projection is not initialized."
+            )
+
         # Create the self-attention and padding masks
         pad_mask, att_mask = self._create_masks(
             att_context_size=cur_att_context_size,
@@ -689,6 +723,7 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
                 pad_mask=pad_mask,
                 cache_last_channel=cache_last_channel_cur,
                 cache_last_time=cache_last_time_cur,
+                text_context_embedding=text_context_embedding,
             )
 
             if cache_last_channel_cur is not None:

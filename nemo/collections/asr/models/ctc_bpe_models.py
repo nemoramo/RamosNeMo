@@ -30,14 +30,28 @@ from nemo.collections.asr.parts.mixins import ASRBPEMixin
 from nemo.collections.asr.parts.submodules.ctc_decoding import CTCBPEDecoding, CTCBPEDecodingConfig
 from nemo.collections.asr.parts.utils.asr_batching import get_semi_sorted_batch_sampler
 from nemo.collections.common.data.lhotse import get_lhotse_dataloader_from_config
-from nemo.core.classes.common import PretrainedModelInfo
+from nemo.core.classes.common import PretrainedModelInfo, typecheck
+from nemo.core.neural_types import NeuralType, TokenIndex, LengthsType, LogprobsType, LabelsType
 from nemo.utils import logging, model_utils
+from collections import OrderedDict
 
 __all__ = ['EncDecCTCModelBPE']
 
 
 class EncDecCTCModelBPE(EncDecCTCModel, ASRBPEMixin):
     """Encoder decoder CTC-based models with Byte Pair Encoding."""
+
+    @property
+    def input_types(self) -> Optional[Dict[str, NeuralType]]:
+        input_types = super().input_types
+        # Ensure input_types is mutable
+        if input_types is not None:
+            input_types = OrderedDict(input_types)
+            input_types.update({
+                "text_context": NeuralType(('B', 'T'), TokenIndex(), optional=True),
+                "text_context_length": NeuralType(tuple('B'), LengthsType(), optional=True),
+            })
+        return input_types
 
     def __init__(self, cfg: DictConfig, trainer=None):
         # Convert to Hydra 1.0 compatible DictConfig
@@ -670,3 +684,60 @@ class EncDecCTCModelBPE(EncDecCTCModel, ASRBPEMixin):
         results.append(model)
 
         return results
+
+    @typecheck()
+    def forward(
+        self, input_signal=None, input_signal_length=None, text_context=None, text_context_length=None
+    ):
+        """
+        Forward pass of the model.
+
+        Args:
+            input_signal: Tensor that represents a batch of raw audio signals,
+                of shape [B, T]. T here represents timesteps, with 1 second of audio represented as
+                `self.sample_rate` number of floating point values.
+            input_signal_length: Vector of length B, that contains the individual lengths of the audio
+                sequences.
+            text_context: Optional tensor representing text context of shape [B, T_text].
+            text_context_length: Optional tensor representing lengths of text context of shape [B].
+
+        Returns:
+            A tuple of 3 elements -
+            1) The log probabilities tensor of shape [B, T, D].
+            2) The lengths of the acoustic sequence after propagation through the encoder, of shape [B].
+            3) The greedy token predictions of the model of shape [B, T] (via argmax)
+        """
+        # Note: This forward pass explicitly uses input_signal and input_signal_length.
+        # It does not support pre-processed signals like the parent EncDecCTCModel.forward does.
+        # This is a simplification for this override, focusing on adding text_context.
+        if input_signal is None or input_signal_length is None:
+            raise ValueError(
+                f"{self} requires ``input_signal`` and ``input_signal_length``."
+            )
+
+        processed_signal, processed_signal_length = self.preprocessor(
+            input_signal=input_signal,
+            length=input_signal_length,
+        )
+
+        if self.spec_augmentation is not None and self.training:
+            processed_signal = self.spec_augmentation(input_spec=processed_signal, length=processed_signal_length)
+
+        # Pass text_context and text_context_length to the encoder
+        # Note: current ConformerEncoder might not use text_context_length, but it's passed for future compatibility.
+        encoder_output = self.encoder(
+            audio_signal=processed_signal,
+            length=processed_signal_length,
+            text_context=text_context
+        )
+        encoded = encoder_output[0]
+        encoded_len = encoder_output[1]
+
+        log_probs = self.decoder(encoder_output=encoded)
+        greedy_predictions = log_probs.argmax(dim=-1, keepdim=False)
+
+        return (
+            log_probs,
+            encoded_len,
+            greedy_predictions,
+        )

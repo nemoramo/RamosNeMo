@@ -18,6 +18,8 @@ from omegaconf import OmegaConf
 
 from nemo.collections.asr import modules
 from nemo.collections.asr.parts.utils.rnnt_utils import Hypothesis
+# Import ConformerLayer
+from nemo.collections.asr.parts.submodules.conformer_modules import ConformerLayer
 from nemo.core.utils import numba_utils
 from nemo.core.utils.numba_utils import __NUMBA_MINIMUM_VERSION__
 from nemo.utils import config_utils, logging
@@ -334,6 +336,95 @@ class TestASRModulesBasicTests:
 
         # assert vocab size
         assert jointnet.num_classes_with_blank == vocab_size + 1
+
+
+class TestConformerModules:
+    @pytest.mark.unit
+    def test_conformer_layer_with_text_context(self):
+        d_model = 64
+        batch_size = 4
+        audio_seq_len = 50
+        text_seq_len = 30
+
+        layer = modules.ConformerLayer(
+            d_model=d_model,
+            d_ff=d_model * 2,  # Example d_ff
+            n_heads=4,
+            conv_kernel_size=31,
+            self_attention_model='abs_pos',
+            cross_attention_model='abs_pos',
+        )
+        layer.eval() # Set to eval mode to avoid dropout effects if any
+
+        # Dummy inputs
+        x = torch.randn(batch_size, audio_seq_len, d_model)
+        # For 'abs_pos' self-attention, att_mask and pos_emb are often handled outside or not strictly needed by the MHA module itself
+        # For simplicity, we pass None, assuming typical usage where positional encodings are added to x before the layer.
+        att_mask = None
+        pos_emb = None # For abs_pos, positional embeddings are typically added to 'x' before this layer.
+
+        # pad_mask is (B, T) where True means padded
+        pad_mask = torch.zeros(batch_size, audio_seq_len, dtype=torch.bool)
+        # Example: last 10 elements of 2nd sample are padded
+        if audio_seq_len > 10 and batch_size > 1:
+            pad_mask[1, -10:] = True
+
+
+        text_context_embedding = torch.randn(batch_size, text_seq_len, d_model)
+
+        # Forward pass with text_context_embedding
+        # Note: ConformerLayer's forward for abs_pos does not return cache by default unless cache_last_channel is passed
+        output_with_context = layer(
+            x.clone(), att_mask=att_mask, pos_emb=pos_emb, pad_mask=pad_mask.clone(), text_context_embedding=text_context_embedding.clone()
+        )
+        assert output_with_context.shape == x.shape
+
+        # Forward pass without text_context_embedding
+        output_without_context = layer(
+            x.clone(), att_mask=att_mask, pos_emb=pos_emb, pad_mask=pad_mask.clone(), text_context_embedding=None
+        )
+        assert output_without_context.shape == x.shape
+
+        # Check that outputs are different (cross-attention should have an effect)
+        # This is a basic check; a more rigorous check would involve inspecting gradients or specific values.
+        # It's possible, though unlikely with random inputs, that they could be very close if weights are small.
+        assert not torch.allclose(output_with_context, output_without_context, atol=1e-6)
+
+
+    @pytest.mark.unit
+    def test_conformer_layer_instantiation_variants(self):
+        # Test default cross_attention_model ('abs_pos')
+        layer_default_cross_attn = modules.ConformerLayer(
+            d_model=64, d_ff=128, n_heads=4, conv_kernel_size=31, self_attention_model='abs_pos'
+        )
+        assert layer_default_cross_attn is not None
+        assert hasattr(layer_default_cross_attn, 'cross_attn') # Default is 'abs_pos', so it should be created
+        assert layer_default_cross_attn.cross_attention_model == 'abs_pos'
+
+        # Test with cross_attention_model=None
+        layer_no_cross_attn = modules.ConformerLayer(
+            d_model=64,
+            d_ff=128,
+            n_heads=4,
+            conv_kernel_size=31,
+            self_attention_model='abs_pos',
+            cross_attention_model=None,
+        )
+        assert layer_no_cross_attn is not None
+        assert not hasattr(layer_no_cross_attn, 'cross_attn') # Should not be created
+        assert layer_no_cross_attn.cross_attention_model is None
+
+
+        # Test with an invalid cross_attention_model
+        with pytest.raises(ValueError):
+            modules.ConformerLayer(
+                d_model=64,
+                d_ff=128,
+                n_heads=4,
+                conv_kernel_size=31,
+                self_attention_model='abs_pos',
+                cross_attention_model='invalid_model',
+            )
 
     @pytest.mark.unit
     def test_HATJoint(self):
