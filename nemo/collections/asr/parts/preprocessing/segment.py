@@ -124,7 +124,7 @@ def _get_s3_cache():
     try:
         import diskcache
     except ModuleNotFoundError:
-        logging.debug('diskcache is not installed; S3 disk caching is disabled.')
+        logging.warning('diskcache is not installed; S3 disk caching is disabled.')
         return None
 
     cache_dir = _S3_CACHE_CONFIG.get('cache_dir')
