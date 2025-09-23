@@ -129,6 +129,10 @@ def make_ctm(
                 ):  # don't save blanks if we don't want to
                     # replace any spaces with <space> so we dont introduce extra space characters to our CTM files
                     text = text.replace(" ", SPACE_TOKEN)
+                    confidence = getattr(boundary_info_, "probability", None)
+                    if confidence is not None:
+                        confidence = float(confidence)
+                        confidence = max(0.0, min(1.0, confidence))
 
                     ctm_line = get_ctm_line(
                         source=utt_obj.utt_id,
@@ -136,7 +140,7 @@ def make_ctm(
                         start_time=start_time,
                         duration=end_time - start_time,
                         token=text,
-                        conf=None,
+                        conf=confidence,
                         type_of_token='lex',
                         speaker=None,
                     )

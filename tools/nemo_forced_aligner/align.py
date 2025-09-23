@@ -41,6 +41,7 @@ from nemo.utils import logging
 try:
     from nemo.collections.asr.parts.utils.aligner_utils import (
         add_t_start_end_to_utt_obj,
+        add_probabilities_to_utt_obj,
         get_batch_variables,
         viterbi_decoding,
     )
@@ -359,9 +360,11 @@ def main(cfg: AlignmentConfig):
 
         alignments_batch = viterbi_decoding(log_probs_batch, y_batch, T_batch, U_batch, viterbi_device)
 
-        for utt_obj, alignment_utt in zip(utt_obj_batch, alignments_batch):
+        for idx, (utt_obj, alignment_utt) in enumerate(zip(utt_obj_batch, alignments_batch)):
 
             utt_obj = add_t_start_end_to_utt_obj(utt_obj, alignment_utt, output_timestep_duration)
+            log_probs_utt = log_probs_batch[idx, : int(T_batch[idx].item()), :]
+            utt_obj = add_probabilities_to_utt_obj(utt_obj, alignment_utt, log_probs_utt)
 
             if "ctm" in cfg.save_output_file_formats:
                 utt_obj = make_ctm_files(
@@ -385,3 +388,4 @@ def main(cfg: AlignmentConfig):
 
 if __name__ == "__main__":
     main()
+

@@ -16,6 +16,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Optional, Union
 
+import math
 import numpy as np
 import torch
 from torch.utils.data import DataLoader
@@ -39,6 +40,7 @@ class Token:
     s_end: int = None
     t_start: float = None
     t_end: float = None
+    probability: Optional[float] = None
 
 
 @dataclass
@@ -48,6 +50,7 @@ class Word:
     s_end: int = None
     t_start: float = None
     t_end: float = None
+    probability: Optional[float] = None
     tokens: List[Token] = field(default_factory=list)
 
 
@@ -58,6 +61,7 @@ class Segment:
     s_end: int = None
     t_start: float = None
     t_end: float = None
+    probability: Optional[float] = None
     words_and_tokens: List[Union[Word, Token]] = field(default_factory=list)
 
 
@@ -720,6 +724,101 @@ def add_t_start_end_to_utt_obj(utt_obj: Utterance, alignment_utt: List[int], out
                 token.t_end = -1
 
     return utt_obj
+
+
+def add_probabilities_to_utt_obj(
+    utt_obj: Utterance,
+    alignment_utt: List[int],
+    log_probs_utt: torch.Tensor,
+    padding_value: float = -3.4e38,
+) -> Utterance:
+    """Attach average frame probabilities to tokens, words, and segments in ``utt_obj``."""
+
+    if log_probs_utt is None or len(alignment_utt) == 0:
+        return utt_obj
+
+    token_ids = utt_obj.token_ids_with_blanks
+    if not token_ids:
+        return utt_obj
+
+    log_probs_cpu = log_probs_utt.detach().cpu()
+    num_frames = min(len(alignment_utt), log_probs_cpu.size(0))
+    if num_frames == 0:
+        return utt_obj
+
+    num_tokens = len(token_ids)
+    prob_sums = [0.0] * num_tokens
+    frame_counts = [0] * num_tokens
+
+    for timestep in range(num_frames):
+        token_position = alignment_utt[timestep]
+        if token_position < 0 or token_position >= num_tokens:
+            continue
+        token_id = token_ids[token_position]
+        if token_id < 0 or token_id >= log_probs_cpu.size(1):
+            continue
+        log_prob = float(log_probs_cpu[timestep, token_id])
+        if log_prob <= padding_value:
+            continue
+        prob = math.exp(log_prob)
+        prob_sums[token_position] += prob
+        frame_counts[token_position] += 1
+
+    token_stats = {
+        idx: (prob_sums[idx], frame_counts[idx])
+        for idx in range(num_tokens)
+        if frame_counts[idx] > 0
+    }
+
+    def _assign_token_probability(token: Token):
+        stats = token_stats.get(token.s_start)
+        token.probability = (stats[0] / stats[1]) if stats else None
+
+    def _aggregate(indices):
+        total_sum = 0.0
+        total_count = 0
+        for idx in indices:
+            stats = token_stats.get(idx)
+            if not stats:
+                continue
+            total_sum += stats[0]
+            total_count += stats[1]
+        if total_count == 0:
+            return None, 0.0, 0
+        return total_sum / total_count, total_sum, total_count
+
+    for segment_or_token in utt_obj.segments_and_tokens:
+        if isinstance(segment_or_token, Segment):
+            segment = segment_or_token
+            seg_sum = 0.0
+            seg_count = 0
+
+            for word_or_token in segment.words_and_tokens:
+                if isinstance(word_or_token, Word):
+                    word = word_or_token
+                    for token in word.tokens:
+                        _assign_token_probability(token)
+                    token_indices = [token.s_start for token in word.tokens if token.text != BLANK_TOKEN]
+                    word_prob, word_sum, word_count = _aggregate(token_indices)
+                    word.probability = word_prob
+                    seg_sum += word_sum
+                    seg_count += word_count
+                else:
+                    token = word_or_token
+                    _assign_token_probability(token)
+                    if token.text != BLANK_TOKEN:
+                        stats = token_stats.get(token.s_start)
+                        if stats:
+                            seg_sum += stats[0]
+                            seg_count += stats[1]
+
+            segment.probability = (seg_sum / seg_count) if seg_count > 0 else None
+        else:
+            token = segment_or_token
+            _assign_token_probability(token)
+
+    return utt_obj
+
 
 
 def viterbi_decoding(
