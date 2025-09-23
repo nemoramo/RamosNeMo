@@ -1,0 +1,3 @@
+[submodule "external/speech_related_tools"]
+	path = external/speech_related_tools
+	url = ssh://git@git.ai-transsion.com:18022/asr/speech_related_tools.git
