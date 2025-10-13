@@ -74,6 +74,12 @@
 #
 #   --spe_split_digits: If true, digits are split into individual tokens.
 #
+#   --spe_split_punct: If true, common punctuation characters (ASCII + common CJK) will be added as
+#      user-defined symbols so they are always treated as independent tokens.
+#
+#   --spe_force_digits: If true, digits 0-9 will be added as user-defined symbols so each becomes a
+#      standalone token (and this also implies --spe_split_digits behavior during training).
+#
 #   --spe_sample_size: If the dataset is too large, consider using a sampled dataset indicated by a
 #       positive integer. By default, any negative value (default = -1) will use the entire dataset.
 #
@@ -99,6 +105,7 @@ import argparse
 import json
 import logging
 import os
+import string
 from typing import List, Optional
 
 import tokenizers
@@ -141,6 +148,18 @@ parser.add_argument(
     '--spe_remove_extra_whitespaces',
     action='store_true',
     help='Remove leading, trailing, and duplicate internal whitespace.',
+)
+
+# Custom options: force splitting punctuation and digits into standalone tokens for BPE
+parser.add_argument(
+    '--spe_split_punct',
+    action='store_true',
+    help='Force common punctuation characters to become independent tokens by registering them as user-defined symbols.',
+)
+parser.add_argument(
+    '--spe_force_digits',
+    action='store_true',
+    help='Ensure digits 0-9 are individual tokens by adding them as user-defined symbols (implies --spe_split_digits).',
 )
 
 parser.add_argument(
@@ -233,6 +252,8 @@ def __process_data(
     spe_split_digits: bool,
     spe_remove_extra_whitespaces: bool,
     lower_case: bool,
+    spe_split_punct: bool,
+    spe_force_digits: bool,
 ):
     """
     Converts flac to wav and build manifests's json
@@ -291,6 +312,34 @@ def __process_data(
             os.remove(os.path.join(tokenizer_dir, 'tokenizer.model'))
 
         # Build tokenizer
+        # Optionally augment user-defined symbols with punctuation and/or digits
+        effective_user_symbols = list(spe_user_defined_symbols) if spe_user_defined_symbols else []
+
+        if spe_split_punct:
+            # ASCII punctuation + common CJK punctuation
+            cjk_punct = [
+                '，', '。', '、', '；', '：', '？', '！', '（', '）', '【', '】', '《', '》',
+                '〈', '〉', '「', '」', '『', '』', '—', '–', '…', '·', '￥', '“', '”', '‘', '’', '～', '．'
+            ]
+            punct_list = list(string.punctuation) + cjk_punct
+            # de-duplicate while preserving order
+            seen = set(effective_user_symbols)
+            for ch in punct_list:
+                if ch not in seen:
+                    effective_user_symbols.append(ch)
+                    seen.add(ch)
+
+        if spe_force_digits:
+            # ensure digits 0..9 are standalone tokens
+            digits = list('0123456789')
+            seen = set(effective_user_symbols)
+            for d in digits:
+                if d not in seen:
+                    effective_user_symbols.append(d)
+                    seen.add(d)
+            # also ensure split_digits behavior during training
+            spe_split_digits = True
+
         tokenizer_path, vocab_path = create_spt_model(
             data_file=text_path,
             vocab_size=vocab_size,
@@ -306,7 +355,7 @@ def __process_data(
             eos=spe_eos,
             pad=spe_pad,
             control_symbols=spe_control_symbols,
-            user_defined_symbols=spe_user_defined_symbols,
+            user_defined_symbols=effective_user_symbols,
             byte_fallback=spe_byte_fallback,
             split_digits=spe_split_digits,
             remove_extra_whitespaces=spe_remove_extra_whitespaces,
@@ -345,6 +394,8 @@ def main():
     spe_split_digits = args.spe_split_digits
     spe_remove_extra_whitespaces = args.spe_remove_extra_whitespaces
     lower_case = args.lower_case
+    spe_split_punct = args.spe_split_punct
+    spe_force_digits = args.spe_force_digits
 
     if not os.path.exists(data_root):
         os.makedirs(data_root)
@@ -376,6 +427,8 @@ def main():
         spe_byte_fallback=spe_byte_fallback,
         spe_split_digits=spe_split_digits,
         spe_remove_extra_whitespaces=spe_remove_extra_whitespaces,
+        spe_split_punct=spe_split_punct,
+        spe_force_digits=spe_force_digits,
     )
 
     print("Serialized tokenizer at location :", tokenizer_path)
