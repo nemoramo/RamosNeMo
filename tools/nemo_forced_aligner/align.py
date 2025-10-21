@@ -338,26 +338,31 @@ def main(cfg: AlignmentConfig):
         else:
             gt_text_batch = None
 
-        (
-            log_probs_batch,
-            y_batch,
-            T_batch,
-            U_batch,
-            utt_obj_batch,
-            output_timestep_duration,
-        ) = get_batch_variables(
-            audio=[line['audio_filepath'] for line in manifest_lines_batch],
-            model=model,
-            segment_separators=cfg.additional_segment_grouping_separator,
-            align_using_pred_text=cfg.align_using_pred_text,
-            audio_filepath_parts_in_utt_id=cfg.audio_filepath_parts_in_utt_id,
-            gt_text_batch=gt_text_batch,
-            output_timestep_duration=output_timestep_duration,
-            simulate_cache_aware_streaming=cfg.simulate_cache_aware_streaming,
-            use_buffered_chunked_streaming=cfg.use_buffered_chunked_streaming,
-            buffered_chunk_params=buffered_chunk_params,
-        )
+        # Use CUDA AMP (float16) during logits generation when running on GPU.
+        use_amp = transcribe_device.type == 'cuda'
+        with torch.cuda.amp.autocast(enabled=use_amp, dtype=torch.float16):
+            (
+                log_probs_batch,
+                y_batch,
+                T_batch,
+                U_batch,
+                utt_obj_batch,
+                output_timestep_duration,
+            ) = get_batch_variables(
+                audio=[line['audio_filepath'] for line in manifest_lines_batch],
+                model=model,
+                segment_separators=cfg.additional_segment_grouping_separator,
+                align_using_pred_text=cfg.align_using_pred_text,
+                audio_filepath_parts_in_utt_id=cfg.audio_filepath_parts_in_utt_id,
+                gt_text_batch=gt_text_batch,
+                output_timestep_duration=output_timestep_duration,
+                simulate_cache_aware_streaming=cfg.simulate_cache_aware_streaming,
+                use_buffered_chunked_streaming=cfg.use_buffered_chunked_streaming,
+                buffered_chunk_params=buffered_chunk_params,
+            )
 
+        # Ensure float32 for Viterbi decoding stability and padding handling
+        log_probs_batch = log_probs_batch.float()
         alignments_batch = viterbi_decoding(log_probs_batch, y_batch, T_batch, U_batch, viterbi_device)
 
         for idx, (utt_obj, alignment_utt) in enumerate(zip(utt_obj_batch, alignments_batch)):
