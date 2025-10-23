@@ -16,6 +16,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Optional, Union
 
+import os
+import unicodedata
+
 import math
 import numpy as np
 import torch
@@ -106,52 +109,101 @@ def is_sub_or_superscript_pair(ref_text, text):
             return True
     return False
 
+_NFA_SKIP_CASE_RESTORE = os.getenv("NFA_SKIP_CASE_RESTORE", "0").lower() in ("1", "true", "yes")
+
+
+def _has_cased_letters(s: str) -> bool:
+    """Return True if string contains any cased letters (Lu/Ll/Lt).
+
+    For scripts without case (e.g., Devanagari, Chinese, Arabic), returns False.
+    """
+    for ch in s:
+        if unicodedata.category(ch) in ("Lu", "Ll", "Lt"):
+            return True
+    return False
+
 
 def restore_token_case(word: str, word_tokens: List[str]) -> List[str]:
+    """Restore token letter case to match the original ``word``.
 
-    # remove repeated "▁" and "_" from word as that is what the tokenizer will do
-    while "▁▁" in word:
-        word = word.replace("▁▁", "▁")
+    - For caseless scripts (no Lu/Ll/Lt in ``word``), return tokens unchanged.
+    - Normalize ``word`` to NFC to avoid composed/decomposed mismatches.
+    - Treat SentencePiece boundary "▁" and underscore "_" as spacing markers.
+    - On any unexpected mismatch, fall back to original tokens instead of raising.
+    """
+    try:
+        if _NFA_SKIP_CASE_RESTORE:
+            return word_tokens
 
-    while "__" in word:
-        word = word.replace("__", "_")
+        # Normalize for robust char-by-char alignment (e.g., Nukta forms in Devanagari)
+        word_nfc = unicodedata.normalize("NFC", word)
 
-    word_tokens_cased = []
-    word_char_pointer = 0
+        # Remove repeated boundary markers as tokenizer would do
+        while "▁▁" in word_nfc:
+            word_nfc = word_nfc.replace("▁▁", "▁")
+        while "__" in word_nfc:
+            word_nfc = word_nfc.replace("__", "_")
 
-    for token in word_tokens:
-        token_cased = ""
+        # For scripts without case, do nothing
+        if not _has_cased_letters(word_nfc):
+            return word_tokens
 
-        for token_char in token:
-            if token_char == word[word_char_pointer]:
-                token_cased += token_char
-                word_char_pointer += 1
+        out_tokens: List[str] = []
+        p = 0  # pointer into word_nfc
 
-            else:
-                if token_char.upper() == word[word_char_pointer] or is_sub_or_superscript_pair(
-                    token_char, word[word_char_pointer]
-                ):
-                    token_cased += token_char.upper()
-                    word_char_pointer += 1
-                else:
-                    if token_char == "▁" or token_char == "_":
-                        if (
-                            word[word_char_pointer] == "▁"
-                            or word[word_char_pointer] == "_"
-                            or word[word_char_pointer] == " "
-                        ):
-                            token_cased += token_char
-                            word_char_pointer += 1
-                        elif word_char_pointer == 0:
-                            token_cased += token_char
-                    else:
-                        raise RuntimeError(
-                            f"Unexpected error - failed to recover capitalization of tokens for word {word}"
-                        )
+        for token in word_tokens:
+            token_out_chars: List[str] = []
+            for token_char in token:
+                # Allow a leading boundary token char even if word doesn't start with one
+                if token_char in ("▁", "_") and p == 0 and (len(word_nfc) == 0 or word_nfc[0] not in ("▁", "_", " ")):
+                    token_out_chars.append(token_char)
+                    continue
 
-        word_tokens_cased.append(token_cased)
+                # Bounds check; if we run out, fall back safely
+                if p >= len(word_nfc):
+                    logging.debug(
+                        "restore_token_case: pointer overflow, fallback; word=%r tokens=%r", word, word_tokens
+                    )
+                    return word_tokens
 
-    return word_tokens_cased
+                wch = word_nfc[p]
+
+                if token_char == wch:
+                    token_out_chars.append(token_char)
+                    p += 1
+                    continue
+
+                # Case restore or numeral sub/superscript mapping treated as equal
+                if token_char.upper() == wch or is_sub_or_superscript_pair(token_char, wch):
+                    token_out_chars.append(token_char.upper())
+                    p += 1
+                    continue
+
+                # Treat spacing markers as equivalent: token '_' or '▁' can match word '▁', '_' or space
+                if token_char in ("▁", "_") and wch in ("▁", "_", " "):
+                    token_out_chars.append(token_char)
+                    p += 1
+                    continue
+
+                # Unexpected mismatch; be resilient and fall back to original tokens
+                logging.debug(
+                    "restore_token_case: mismatch (fallback to original tokens); word=%r tokens=%r", word, word_tokens
+                )
+                return word_tokens
+
+            out_tokens.append("".join(token_out_chars))
+
+        return out_tokens
+
+    except Exception as e:
+        # Never interrupt alignment if case restoration fails
+        logging.warning(
+            "restore_token_case: unexpected error for word=%r tokens=%r: %s. Returning original tokens.",
+            word,
+            word_tokens,
+            e,
+        )
+        return word_tokens
 
 
 def get_char_tokens(text, model):
