@@ -361,8 +361,45 @@ def wrap_transcription(hyps: List[str]) -> List[rnnt_utils.Hypothesis]:
 
 
 def setup_model(cfg: DictConfig, map_location: torch.device) -> Tuple[ASRModel, str]:
-    """Setup model from cfg and return model and model name for next step"""
-    if cfg.model_path is not None and cfg.model_path != "None":
+    """Setup model from cfg and return model and model name for next step
+
+    Supports the following inputs (in priority order):
+    - cfg.ckpt_path: path to a PyTorch Lightning .ckpt produced by NeMo/Lightning
+    - cfg.model_path: path to a .nemo archive
+    - cfg.pretrained_name: NGC pretrained model name
+    """
+    # 1) Load from PTL checkpoint if provided
+    ckpt_path = getattr(cfg, "ckpt_path", None)
+    if ckpt_path is not None and ckpt_path != "None":
+        # Infer model class from checkpoint hyperparameters (cfg.target)
+        checkpoint = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+        hparams = checkpoint.get("hyper_parameters", {}) if isinstance(checkpoint, dict) else {}
+        cfg_in_ckpt = hparams.get("cfg") if isinstance(hparams, dict) else None
+        if not cfg_in_ckpt or "target" not in cfg_in_ckpt:
+            raise ValueError(
+                f"Unable to resolve model class from checkpoint: {ckpt_path}. "
+                "Expected 'hyper_parameters.cfg.target' to be present."
+            )
+
+        classpath = cfg_in_ckpt["target"]
+        imported_class = model_utils.import_class_by_path(classpath)  # type: ASRModel
+        logging.info(f"Restoring model from ckpt as : {imported_class.__name__}")
+
+        # Allow strictness override if present in cfg
+        strict = getattr(cfg, "ckpt_strict_load", True)
+        # Optional Lightning hparams file (e.g., hparams.yaml)
+        hparams_file = getattr(cfg, "hparams_file", None)
+
+        asr_model = imported_class.load_from_checkpoint(
+            checkpoint_path=ckpt_path,
+            map_location=map_location,
+            hparams_file=hparams_file,
+            strict=strict,
+        )  # type: ASRModel
+        model_name = os.path.splitext(os.path.basename(ckpt_path))[0]
+
+    # 2) Load from .nemo archive
+    elif cfg.model_path is not None and cfg.model_path != "None":
         # restore model from .nemo file path
         model_cfg = ASRModel.restore_from(restore_path=cfg.model_path, return_config=True)
         classpath = model_cfg.target  # original class path

@@ -21,7 +21,7 @@ same directory during execution.
 
 # Arguments
 
-<< All arguments of `transcribe_speech.py` are inherited by this script, so please refer to `transcribe_speech.py`
+<< All arguments of `transcribe_speech.py` are inherited by this script (including optional `ckpt_path` + `hparams_file` for loading from a Lightning .ckpt). Please refer to `transcribe_speech.py`
 for full list of arguments >>
 
     dataset_manifest: Required - path to dataset JSON manifest file (in NeMo format)
