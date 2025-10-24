@@ -47,6 +47,8 @@ Transcribe audio file on a single CPU/GPU. Useful for transcription of moderate 
 
 # Arguments
   model_path: path to .nemo ASR checkpoint
+  ckpt_path: path to Lightning .ckpt (from training) [optional]
+  hparams_file: path to Lightning hparams.yaml for ckpt [optional]
   pretrained_name: name of pretrained ASR model (from NGC registry)
   audio_dir: path to directory with audio files
   dataset_manifest: path to dataset JSON manifest file (in NeMo formats
@@ -87,6 +89,8 @@ Results are returned in a JSON manifest file.
 
 python transcribe_speech.py \
     model_path=null \
+    ckpt_path=null \
+    hparams_file=null \
     pretrained_name=null \
     audio_dir="<remove or path to folder of audio files>" \
     dataset_manifest="<remove or path to manifest>" \
@@ -120,6 +124,13 @@ class TranscriptionConfig:
 
     # Required configs
     model_path: Optional[str] = None  # Path to a .nemo file
+    # Optional: Path to a PyTorch Lightning checkpoint (.ckpt) saved during training
+    # If provided, it takes precedence over `model_path` and `pretrained_name`.
+    ckpt_path: Optional[str] = None
+    # Optional: Path to Lightning hparams.yaml to help reconstruct the model class args when loading ckpt
+    hparams_file: Optional[str] = None
+    # Whether to strictly enforce key matching when loading ckpt
+    ckpt_strict_load: bool = True
     pretrained_name: Optional[str] = None  # Name of a pretrained model
     audio_dir: Optional[str] = None  # Path to a directory which contains audio files
     dataset_manifest: Optional[str] = None  # Path to dataset's JSON manifest
@@ -227,8 +238,8 @@ def main(cfg: TranscriptionConfig) -> Union[TranscriptionConfig, List[Hypothesis
     if cfg.random_seed:
         pl.seed_everything(cfg.random_seed)
 
-    if cfg.model_path is None and cfg.pretrained_name is None:
-        raise ValueError("Both cfg.model_path and cfg.pretrained_name cannot be None!")
+    if cfg.ckpt_path is None and cfg.model_path is None and cfg.pretrained_name is None:
+        raise ValueError("At least one of cfg.ckpt_path, cfg.model_path or cfg.pretrained_name must be set!")
     if cfg.audio_dir is None and cfg.dataset_manifest is None:
         raise ValueError("Both cfg.audio_dir and cfg.dataset_manifest cannot be None!")
 
