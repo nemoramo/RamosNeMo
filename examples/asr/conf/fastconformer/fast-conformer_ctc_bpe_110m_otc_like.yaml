@@ -1,0 +1,37 @@
+# Overlay config to enable OTC-like CTC loss for FastConformer CTC-BPE models.
+# Base to merge with: examples/asr/conf/fastconformer/fast-conformer_ctc_bpe_110m.yaml
+
+name: fast-conformer_ctc_bpe_110m_otc_like
+
+model:
+  otc_like_loss:
+    enabled: true
+    add_star_label: true
+    blank_id: -1
+
+    # Penalties (can be scheduled via OTCLambdaScheduler)
+    lambda_self: 1.2
+    lambda_bypass: 0.6
+
+    # Candidate priors for -logsumexp
+    alpha_drop: 0.0
+    alpha_star: 0.0
+
+    # Candidate generation (keep K small)
+    num_alternatives: 3
+    drop_prob: 0.7
+    star_prob: 0.7
+
+    # Numeric stability clamps
+    clamp_min: -1e4
+    clamp_max: 1e4
+    star_min: -1e4
+
+# Optional epoch scheduler for lambdas (registered by training script)
+otc_scheduler:
+  enabled: true
+  decay: 0.95
+  start_epoch: 0
+  min_self: 0.3
+  min_bypass: 0.2
+

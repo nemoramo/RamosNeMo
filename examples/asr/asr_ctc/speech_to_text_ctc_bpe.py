@@ -68,6 +68,7 @@ import lightning.pytorch as pl
 from omegaconf import OmegaConf
 
 from nemo.collections.asr.models.ctc_bpe_models import EncDecCTCModelBPE
+from nemo.collections.asr.parts.otc_lambda_scheduler import OTCLambdaScheduler
 from nemo.core.config import hydra_runner
 from nemo.utils import logging
 from nemo.utils.exp_manager import exp_manager
@@ -78,7 +79,23 @@ from nemo.utils.trainer_utils import resolve_trainer_cfg
 def main(cfg):
     logging.info(f'Hydra config: {OmegaConf.to_yaml(cfg)}')
 
-    trainer = pl.Trainer(**resolve_trainer_cfg(cfg.trainer))
+    # Build Trainer with optional OTC lambda scheduler callback
+    trainer_cfg = resolve_trainer_cfg(cfg.trainer)
+    callbacks = list(trainer_cfg.get('callbacks', []))
+    otc_sched_cfg = cfg.get('otc_scheduler')
+    if otc_sched_cfg and otc_sched_cfg.get('enabled', False):
+        callbacks.append(
+            OTCLambdaScheduler(
+                decay=float(otc_sched_cfg.get('decay', 0.95)),
+                start_epoch=int(otc_sched_cfg.get('start_epoch', 0)),
+                min_self=otc_sched_cfg.get('min_self', None),
+                min_bypass=otc_sched_cfg.get('min_bypass', None),
+                log_name_prefix=str(otc_sched_cfg.get('log_name_prefix', 'otc')),
+            )
+        )
+        trainer_cfg['callbacks'] = callbacks
+
+    trainer = pl.Trainer(**trainer_cfg)
     exp_manager(trainer, cfg.get("exp_manager", None))
     asr_model = EncDecCTCModelBPE(cfg=cfg.model, trainer=trainer)
 

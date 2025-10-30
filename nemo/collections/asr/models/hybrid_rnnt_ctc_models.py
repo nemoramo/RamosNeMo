@@ -21,6 +21,7 @@ from omegaconf import DictConfig, OmegaConf, open_dict
 
 from nemo.collections.asr.data.audio_to_text_dali import DALIOutputs
 from nemo.collections.asr.losses.ctc import CTCLoss
+from nemo.collections.asr.losses.otc_like_ctc import OTCLikeCTCLoss
 from nemo.collections.asr.metrics.wer import WER
 from nemo.collections.asr.models.rnnt_models import EncDecRNNTModel
 from nemo.collections.asr.parts.mixins import ASRBPEMixin, ASRTranscriptionMixin, InterCTCMixin, TranscribeConfig
@@ -65,11 +66,31 @@ class EncDecHybridRNNTCTCModel(EncDecRNNTModel, ASRBPEMixin, InterCTCMixin, ASRT
         self.ctc_decoder = EncDecRNNTModel.from_config_dict(self.cfg.aux_ctc.decoder)
         self.ctc_loss_weight = self.cfg.aux_ctc.get("ctc_loss_weight", 0.5)
 
-        self.ctc_loss = CTCLoss(
-            num_classes=self.ctc_decoder.num_classes_with_blank - 1,
-            zero_infinity=True,
-            reduction=self.cfg.aux_ctc.get("ctc_reduction", "mean_batch"),
-        )
+        otc_cfg = self.cfg.aux_ctc.get("otc_like_loss", None)
+        if otc_cfg is not None and otc_cfg.get("enabled", False):
+            self.ctc_loss = OTCLikeCTCLoss(
+                blank_id=otc_cfg.get("blank_id", -1),
+                add_star_label=otc_cfg.get("add_star_label", True),
+                lambda_self=float(otc_cfg.get("lambda_self", 1.2)),
+                lambda_bypass=float(otc_cfg.get("lambda_bypass", 0.6)),
+                alpha_drop=float(otc_cfg.get("alpha_drop", 0.0)),
+                alpha_star=float(otc_cfg.get("alpha_star", 0.0)),
+                reduction=self.cfg.aux_ctc.get("ctc_reduction", "mean_batch"),
+                zero_infinity=True,
+                num_alternatives=int(otc_cfg.get("num_alternatives", 3)),
+                drop_prob=float(otc_cfg.get("drop_prob", 0.7)),
+                star_prob=float(otc_cfg.get("star_prob", 0.7)),
+                rng=None,
+                clamp_min=float(otc_cfg.get("clamp_min", -1e4)),
+                clamp_max=float(otc_cfg.get("clamp_max", 1e4)),
+                star_min=float(otc_cfg.get("star_min", -1e4)),
+            )
+        else:
+            self.ctc_loss = CTCLoss(
+                num_classes=self.ctc_decoder.num_classes_with_blank - 1,
+                zero_infinity=True,
+                reduction=self.cfg.aux_ctc.get("ctc_reduction", "mean_batch"),
+            )
 
         ctc_decoding_cfg = self.cfg.aux_ctc.get('decoding', None)
         if ctc_decoding_cfg is None:
@@ -447,9 +468,10 @@ class EncDecHybridRNNTCTCModel(EncDecRNNTModel, ASRBPEMixin, InterCTCMixin, ASRT
 
         if self.ctc_loss_weight > 0:
             log_probs = self.ctc_decoder(encoder_output=encoded)
-            ctc_loss = self.ctc_loss(
+            ctc_out = self.ctc_loss(
                 log_probs=log_probs, targets=transcript, input_lengths=encoded_len, target_lengths=transcript_len
             )
+            ctc_loss = ctc_out["loss"] if isinstance(ctc_out, dict) else ctc_out
             tensorboard_logs['train_rnnt_loss'] = loss_value
             tensorboard_logs['train_ctc_loss'] = ctc_loss
             loss_value = (1 - self.ctc_loss_weight) * loss_value + self.ctc_loss_weight * ctc_loss
@@ -581,9 +603,10 @@ class EncDecHybridRNNTCTCModel(EncDecRNNTModel, ASRBPEMixin, InterCTCMixin, ASRT
 
         log_probs = self.ctc_decoder(encoder_output=encoded)
         if self.compute_eval_loss:
-            ctc_loss = self.ctc_loss(
+            ctc_out = self.ctc_loss(
                 log_probs=log_probs, targets=transcript, input_lengths=encoded_len, target_lengths=transcript_len
             )
+            ctc_loss = ctc_out["loss"] if isinstance(ctc_out, dict) else ctc_out
             tensorboard_logs['val_ctc_loss'] = ctc_loss
             tensorboard_logs['val_rnnt_loss'] = loss_value
             loss_value = (1 - self.ctc_loss_weight) * loss_value + self.ctc_loss_weight * ctc_loss
