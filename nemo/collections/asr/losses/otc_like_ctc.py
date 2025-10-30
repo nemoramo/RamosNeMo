@@ -1,5 +1,18 @@
-# Copyright (c) 2025
-# Author： Yufeng Ma
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# Author: Yufeng Ma
 #
 # OTC-like CTC loss for noisy-label robustness, implemented on top of PyTorch CTCLoss.
 # This approximates the Omni-temporal Classification (OTC) idea via:
@@ -109,12 +122,12 @@ class OTCLikeCTCLoss(nn.Module, Serialization, Typing):
         self.drop_prob = float(drop_prob)
         self.star_prob = float(star_prob)
 
-        self.rng = rng  # FIX C3: if None, will be initialized in forward()
-        self.clamp_min = float(clamp_min)  # FIX B1
-        self.clamp_max = float(clamp_max)  # FIX B1
-        self.star_min = float(star_min)    # FIX B2
+        self.rng = rng
+        self.clamp_min = float(clamp_min)
+        self.clamp_max = float(clamp_max)
+        self.star_min = float(star_min)
 
-        # CTC cache (FIX D2)
+        # CTC cache
         self._ctc: Optional[nn.CTCLoss] = None
         self._ctc_blank: Optional[int] = None
 
@@ -122,7 +135,7 @@ class OTCLikeCTCLoss(nn.Module, Serialization, Typing):
         self._lambda_self0 = self.lambda_self
         self._lambda_bypass0 = self.lambda_bypass
 
-    # Optional external scheduling (not required by the fixes, but useful)
+    # Optional external scheduling utility
     def set_epoch(self, epoch: int, decay: float = 0.95):
         """Optionally decay penalties per epoch: lambda^(e) = lambda0 * decay^e."""
         self.lambda_self = self._lambda_self0 * (decay ** epoch)
@@ -159,7 +172,7 @@ class OTCLikeCTCLoss(nn.Module, Serialization, Typing):
     def _pack_targets(
         self, targets_list: Sequence[Sequence[int]], device: torch.device
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        # NOTE (FIX A1/A2): We assume here that each sequence is non-empty.
+        # NOTE: We assume here that each sequence is non-empty.
         # Forward() ensures target_lengths>0 filtering and candidate builders avoid empty sequences.
         flat_tensors = []
         lengths = []
@@ -172,7 +185,7 @@ class OTCLikeCTCLoss(nn.Module, Serialization, Typing):
         return flat, lens
 
     def _ensure_rng(self, device: torch.device):
-        # FIX C3: initialize RNG if not provided
+        # Initialize RNG if not provided
         if self.rng is None:
             self.rng = torch.Generator(device=device)
             # Use torch.initial_seed() so each rank gets a distinct but reproducible seed
@@ -205,7 +218,7 @@ class OTCLikeCTCLoss(nn.Module, Serialization, Typing):
         # Compute star emission: log-mean-exp over non-blank logits
         logits_nonblank = logits[..., mask_nonblank]  # [B,T,C0-1]
         logits_star = torch.logsumexp(logits_nonblank, dim=-1) - math.log(num_nonblank)  # [B,T]
-        # FIX B2: clamp star to avoid -inf cascades when all probs tiny
+        # Clamp star to avoid -inf cascades when all probs tiny
         logits_star = torch.clamp(logits_star, min=self.star_min)
 
         # Self-loop approx: fuse portion of star into blank with penalty lambda_self
@@ -225,12 +238,12 @@ class OTCLikeCTCLoss(nn.Module, Serialization, Typing):
             logits_aug = logits.clone()
             logits_aug[..., blank_id] = logits_blank_eff
 
-        # FIX B1: numeric stability — clamp and do log_softmax in FP32 with AMP disabled
+        # Numeric stability: clamp and compute log_softmax in FP32 with AMP disabled
         logits_aug = torch.clamp(logits_aug, min=self.clamp_min, max=self.clamp_max)
         with torch.cuda.amp.autocast(enabled=False):
             log_probs_aug = F.log_softmax(logits_aug.float(), dim=-1).to(logits_aug.dtype)
 
-        # FIX A3: sanity check
+        # Sanity check
         if star_id is not None:
             assert star_id != blank_id, "star_id must not equal blank_id."
             assert 0 <= blank_id < log_probs_aug.shape[-1]
@@ -250,7 +263,7 @@ class OTCLikeCTCLoss(nn.Module, Serialization, Typing):
             cands: List[candidate][B][L_i]
             masks: List[candidate] of shape [B] boolean tensors; False excludes this candidate for that sample.
         """
-        self._ensure_rng(device)  # FIX C3
+        self._ensure_rng(device)
         g = self.rng
         B = len(base_targets)
 
@@ -316,7 +329,7 @@ class OTCLikeCTCLoss(nn.Module, Serialization, Typing):
         B, T, C0 = log_probs.shape
         blank_id = self._get_blank_id(C0)
 
-        # ---- FIX A2: filter out samples with target_lengths == 0 ----
+        # Filter out samples with target_lengths == 0
         valid_mask = (target_lengths > 0)
         if valid_mask.sum() == 0:
             # No valid samples in this batch: return zero loss (scalar) to keep graph consistent
@@ -342,7 +355,7 @@ class OTCLikeCTCLoss(nn.Module, Serialization, Typing):
         C_aug = log_probs_aug_TBC.shape[-1]
         blank_for_ctc = blank_id  # unchanged even when C_aug = C0 + 1 (star appended at the end)
 
-        # ---- FIX D2: cache CTCLoss ----
+        # Cache CTCLoss
         if (self._ctc is None) or (self._ctc_blank != blank_for_ctc):
             self._ctc = nn.CTCLoss(blank=blank_for_ctc, reduction="none", zero_infinity=self.zero_infinity)
             self._ctc_blank = blank_for_ctc
@@ -351,10 +364,10 @@ class OTCLikeCTCLoss(nn.Module, Serialization, Typing):
         per_cand_priors: List[float] = []
 
         # Build priors aligned with candidates order: orig, drop1, star1
-        # (FIX C1: candidate priors)
+        # Candidate priors
         DEFAULT_PRIORS = [0.0, self.alpha_drop, self.alpha_star]
 
-        # ---- FIX D3: skip CTC computation for candidates with mask.sum()==0 ----
+        # Skip CTC computation for candidates with mask.sum()==0
         for idx_cand, cand in enumerate(candidates):
             mask = cand_masks[idx_cand]
             if not bool(mask.any()):
