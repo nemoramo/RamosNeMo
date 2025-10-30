@@ -1,0 +1,57 @@
+# Overlay config to enable OTC-like CTC loss for the aux CTC head
+# Base to merge with: examples/asr/conf/fastconformer/hybrid_transducer_ctc/fastconformer_hybrid_tdt_ctc_bpe_110m.yaml
+
+name: fastconformer_hybrid_tdt_ctc_bpe_110m_otc_like
+
+model:
+  aux_ctc:
+    # Keep your existing aux_ctc config (decoder, decoding, etc.) and just add the block below
+    otc_like_loss:
+      enabled: true            # turn on OTC-like loss for aux CTC head
+      add_star_label: true     # enable bypass <star> label inside the loss (training-only)
+      blank_id: -1             # assume last index is blank (NeMo default for CTC decoders)
+
+      # Penalties (can be scheduled by OTCLambdaScheduler callback)
+      lambda_self: 1.2         # cost to fuse star mass into blank (self-loop approx)
+      lambda_bypass: 0.6       # cost to consume <star> as a label (bypass approx)
+
+      # Candidate priors for -logsumexp aggregation (optional)
+      alpha_drop: 0.0          # non-negative prior penalty for drop1 candidate
+      alpha_star: 0.0          # non-negative prior penalty for star1 candidate
+
+      # Candidate generation (keep K small to control compute)
+      num_alternatives: 3      # 1: orig; 2: orig+drop1; 3: orig+drop1+star1
+      drop_prob: 0.7           # per-sample probability to apply single-token drop in drop1
+      star_prob: 0.7           # per-sample probability to apply single-token <star> replace in star1
+
+      # Numeric stability clamps (optional; good defaults)
+      clamp_min: -1e4
+      clamp_max: 1e4
+      star_min: -1e4
+
+# Optional: scheduler config (consumed by your training script to register OTCLambdaScheduler)
+# trainer and scripts do not auto-register this; wire it in your script as shown below.
+otc_scheduler:
+  enabled: true
+  decay: 0.95       # per-epoch multiplicative decay for lambda_* (0<decay<=1)
+  start_epoch: 0    # start decaying from this epoch (inclusive)
+  min_self: 0.3     # optional floor for lambda_self
+  min_bypass: 0.2   # optional floor for lambda_bypass
+
+# Usage notes:
+# 1) Merge this file with the base config when launching training (Hydra compose or manual merge).
+# 2) In your training script, register the scheduler if `otc_scheduler.enabled`:
+#
+#   from omegaconf import OmegaConf
+#   from nemo.collections.asr.parts.otc_lambda_scheduler import OTCLambdaScheduler
+#   cfg = ...  # your composed config
+#   cbs = []
+#   if cfg.get("otc_scheduler") and cfg.otc_scheduler.get("enabled", False):
+#       cbs.append(OTCLambdaScheduler(
+#           decay=float(cfg.otc_scheduler.get("decay", 0.95)),
+#           start_epoch=int(cfg.otc_scheduler.get("start_epoch", 0)),
+#           min_self=cfg.otc_scheduler.get("min_self", None),
+#           min_bypass=cfg.otc_scheduler.get("min_bypass", None),
+#       ))
+#   trainer = Trainer(callbacks=cbs, ...)
+

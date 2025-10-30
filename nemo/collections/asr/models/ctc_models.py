@@ -27,6 +27,7 @@ from nemo.collections.asr.data.audio_to_text import _AudioTextDataset
 from nemo.collections.asr.data.audio_to_text_dali import AudioToCharDALIDataset, DALIOutputs
 from nemo.collections.asr.data.audio_to_text_lhotse import LhotseSpeechToTextBpeDataset
 from nemo.collections.asr.losses.ctc import CTCLoss
+from nemo.collections.asr.losses.otc_like_ctc import OTCLikeCTCLoss
 from nemo.collections.asr.metrics.wer import WER
 from nemo.collections.asr.models.asr_model import ASRModel, ExportableEncDecModel
 from nemo.collections.asr.parts.mixins import ASRModuleMixin, ASRTranscriptionMixin, InterCTCMixin, TranscribeConfig
@@ -78,11 +79,33 @@ class EncDecCTCModel(ASRModel, ExportableEncDecModel, ASRModuleMixin, InterCTCMi
 
         self.decoder = EncDecCTCModel.from_config_dict(self._cfg.decoder)
 
-        self.loss = CTCLoss(
-            num_classes=self.decoder.num_classes_with_blank - 1,
-            zero_infinity=True,
-            reduction=self._cfg.get("ctc_reduction", "mean_batch"),
-        )
+        # Loss: standard CTC or optional OTC-like CTC for noisy labels.
+        otc_cfg = self._cfg.get("otc_like_loss", None)
+        if otc_cfg is not None and otc_cfg.get("enabled", False):
+            # decoder returns log_probs with shape [B,T,C], blank id is last index by default
+            self.loss = OTCLikeCTCLoss(
+                blank_id=otc_cfg.get("blank_id", -1),
+                add_star_label=otc_cfg.get("add_star_label", True),
+                lambda_self=float(otc_cfg.get("lambda_self", 1.2)),
+                lambda_bypass=float(otc_cfg.get("lambda_bypass", 0.6)),
+                alpha_drop=float(otc_cfg.get("alpha_drop", 0.0)),
+                alpha_star=float(otc_cfg.get("alpha_star", 0.0)),
+                reduction=self._cfg.get("ctc_reduction", "mean_batch"),
+                zero_infinity=True,
+                num_alternatives=int(otc_cfg.get("num_alternatives", 3)),
+                drop_prob=float(otc_cfg.get("drop_prob", 0.7)),
+                star_prob=float(otc_cfg.get("star_prob", 0.7)),
+                rng=None,
+                clamp_min=float(otc_cfg.get("clamp_min", -1e4)),
+                clamp_max=float(otc_cfg.get("clamp_max", 1e4)),
+                star_min=float(otc_cfg.get("star_min", -1e4)),
+            )
+        else:
+            self.loss = CTCLoss(
+                num_classes=self.decoder.num_classes_with_blank - 1,
+                zero_infinity=True,
+                reduction=self._cfg.get("ctc_reduction", "mean_batch"),
+            )
 
         if hasattr(self._cfg, 'spec_augment') and self._cfg.spec_augment is not None:
             self.spec_augmentation = EncDecCTCModel.from_config_dict(self._cfg.spec_augment)
@@ -566,9 +589,10 @@ class EncDecCTCModel(ASRModel, ExportableEncDecModel, ASRModuleMixin, InterCTCMi
         else:
             log_every_n_steps = 1
 
-        loss_value = self.loss(
+        loss_out = self.loss(
             log_probs=log_probs, targets=transcript, input_lengths=encoded_len, target_lengths=transcript_len
         )
+        loss_value = loss_out["loss"] if isinstance(loss_out, dict) else loss_out
 
         # Add auxiliary losses, if registered
         loss_value = self.add_auxiliary_losses(loss_value)
@@ -633,9 +657,10 @@ class EncDecCTCModel(ASRModel, ExportableEncDecModel, ASRModuleMixin, InterCTCMi
         else:
             log_probs, encoded_len, predictions = self.forward(input_signal=signal, input_signal_length=signal_len)
 
-        loss_value = self.loss(
+        loss_out = self.loss(
             log_probs=log_probs, targets=transcript, input_lengths=encoded_len, target_lengths=transcript_len
         )
+        loss_value = loss_out["loss"] if isinstance(loss_out, dict) else loss_out
         loss_value, metrics = self.add_interctc_losses(
             loss_value,
             transcript,
