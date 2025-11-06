@@ -118,6 +118,42 @@ You may find the example config files of Conformer-Transducer model with charact
 ``<NeMo_git_root>/examples/asr/conf/conformer/conformer_transducer_char.yaml`` and
 with sub-word encoding at ``<NeMo_git_root>/examples/asr/conf/conformer/conformer_transducer_bpe.yaml``.
 
+.. _Conformer-TDT_model:
+
+Conformer-TDT
+~~~~~~~~~~~~~
+
+Conformer-TDT (Token-and-Duration Transducer) is an advanced variant of the Conformer-Transducer model introduced in the paper 
+`Token-and-Duration Transducer for ASR <https://arxiv.org/abs/2304.06795>`_. TDT extends the traditional RNN-T architecture by 
+explicitly modeling both token emissions and their durations, leading to improved accuracy and significantly faster inference speeds.
+
+Key advantages of TDT models:
+
+* **Faster inference**: Up to 2-3x speedup compared to conventional RNN-T models
+* **Better accuracy**: Improved WER on various ASR benchmarks
+* **Streaming support**: Compatible with both streaming and non-streaming inference
+* **State-of-the-art performance**: Parakeet-TDT models achieve top results on the HuggingFace OpenASR Leaderboard
+
+The TDT architecture introduces duration modeling by adding extra outputs to the joint network that predict how many frames 
+each token spans. This explicit duration modeling allows the decoder to process audio more efficiently during inference.
+
+**Configuration**: TDT models use similar configurations to Conformer-Transducer, with key differences in:
+
+* Loss function: Uses TDT loss with additional parameters like ``sigma`` (under-normalization) and ``omega`` (RNN-T loss weight)
+* Joint network: Includes ``num_extra_outputs`` parameter for duration outputs
+* Decoding: Requires ``model_type: "tdt"`` and ``durations`` list specification
+
+Example config files for Conformer-TDT models can be found at:
+
+* ``<NeMo_git_root>/examples/asr/conf/conformer/tdt/conformer_tdt_bpe.yaml``
+* ``<NeMo_git_root>/examples/asr/conf/conformer/tdt/conformer_tdt_bpe_stateless.yaml``
+
+For a comprehensive guide on all tunable parameters, including detailed explanations of key hyperparameters like ``sigma``, 
+``omega``, ``fastemit_lambda``, and ``durations``, see the :doc:`TDT Training Parameters guide <tdt_training_parameters>`.
+
+This model uses BPE encoding and can be instantiated using the :class:`~nemo.collections.asr.models.EncDecRNNTBPEModel` class 
+with appropriate TDT loss configuration.
+
 .. _Conformer-HAT_model:
 
 Conformer-HAT
