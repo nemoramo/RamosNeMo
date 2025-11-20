@@ -99,10 +99,17 @@ class S3Utils:
 
         start_time = time.perf_counter()
         _download_fileobj_with_retry(s3_client, bucket, key, bytes_buffer, config)
-        logging.info(
-            f'Time elapsed downloading {s3_path} to file stream with chunk_size={chunk_size_MB}MB '
-            f'and max_concurrency={max_concurrency}: {(time.perf_counter() - start_time):.2f} seconds'
-        )
+        elapsed = time.perf_counter() - start_time
+        if os.environ.get("NEMO_S3_DOWNLOAD_LOG_LEVEL", "").lower() == "info":
+            logging.info(
+                f'Time elapsed downloading {s3_path} to file stream with chunk_size={chunk_size_MB}MB '
+                f'and max_concurrency={max_concurrency}: {elapsed:.2f} seconds'
+            )
+        else:
+            logging.debug(
+                f'Downloaded {s3_path} to file stream in {elapsed:.2f}s '
+                f'(chunk_size={chunk_size_MB}MB, max_concurrency={max_concurrency})'
+            )
 
         bytes_buffer.seek(0)
         return bytes_buffer
