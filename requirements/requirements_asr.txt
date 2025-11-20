@@ -22,3 +22,6 @@ sox<=1.5.0
 kaldialign<=0.9.1
 whisper_normalizer
 diskcache
+boto3[crt]
+s3fs==0.4.2
+tenacity

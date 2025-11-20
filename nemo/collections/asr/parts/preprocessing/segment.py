@@ -44,6 +44,7 @@ import numpy.typing as npt
 import soundfile as sf
 
 from nemo.utils import logging
+from nemo.utils.s3_dirpath_utils import is_s3_url
 
 # TODO @blisc: Perhaps refactor instead of import guarding
 HAVE_PYDUB = True
@@ -63,6 +64,40 @@ sf_supported_formats = ["." + i.lower() for i in available_formats.keys()]
 
 
 ChannelSelectorType = Union[int, Iterable[int], str]
+
+
+def _download_audio_from_s3(audio_path: str):
+    try:
+        from nemo.utils.s3_utils import S3Utils
+    except ModuleNotFoundError as exc:
+        raise ModuleNotFoundError(
+            "Reading audio files from s3:// paths requires the optional S3 dependencies (boto3[crt], "
+            "s3fs==0.4.2, tenacity). Please install them as documented in docs/source/common/s3_checkpointing.rst."
+        ) from exc
+
+    return S3Utils.download_s3_file_to_stream(audio_path)
+
+
+def _prepare_audio_source(audio_reference):
+    """Return a tuple of (object to read audio from, original path if available, lowercase suffix)."""
+
+    audio_obj = audio_reference
+    audio_path = None
+
+    if isinstance(audio_reference, os.PathLike):
+        audio_reference = os.fspath(audio_reference)
+        audio_obj = audio_reference
+
+    if isinstance(audio_reference, str):
+        audio_path = audio_reference
+        if is_s3_url(audio_reference):
+            audio_obj = _download_audio_from_s3(audio_reference)
+    else:
+        audio_path = getattr(audio_reference, 'name', None)
+
+    audio_suffix = os.path.splitext(audio_path)[-1].lower() if audio_path else ''
+
+    return audio_obj, audio_path, audio_suffix
 
 
 def select_channels(signal: npt.NDArray, channel_selector: Optional[ChannelSelectorType] = None) -> npt.NDArray:
@@ -142,7 +177,9 @@ def get_samples(audio_file: str, target_sr: int = 16000, dtype: str = 'float32')
         samples (numpy.ndarray):
             Time-series sample data from the given audio file
     """
-    with sf.SoundFile(audio_file, 'r') as f:
+    audio_source, _, _ = _prepare_audio_source(audio_file)
+
+    with sf.SoundFile(audio_source, 'r') as f:
         samples = f.read(dtype=dtype)
         if f.samplerate != target_sr:
             samples = librosa.core.resample(samples, orig_sr=f.samplerate, target_sr=target_sr)
@@ -314,7 +351,6 @@ class AudioSegment(object):
                                             set None to use max RMS across channels
         :return: AudioSegment instance
         """
-        samples = None
         if isinstance(audio_file, list):
             return cls.from_file_list(
                 audio_file_list=audio_file,
@@ -333,9 +369,55 @@ class AudioSegment(object):
                 ref_channel=ref_channel,
             )
 
-        if not isinstance(audio_file, str) or os.path.splitext(audio_file)[-1] in sf_supported_formats:
+        audio_source, audio_path, audio_suffix = _prepare_audio_source(audio_file)
+        samples = None
+        sample_rate = target_sr
+        audio_format = audio_suffix.lstrip('.') if audio_suffix else None
+        codec = ffmpeg_codecs.get(audio_format) if audio_format else None
+        allow_soundfile = audio_path is None or audio_suffix in sf_supported_formats
+        tried_libs = []
+        if HAVE_PYDUB:
+            tried_libs.append('pydub')
+        if allow_soundfile:
+            tried_libs.append('soundfile')
+        audio_display = audio_path if audio_path is not None else audio_file
+
+        def _rewind_source():
+            if hasattr(audio_source, 'seek'):
+                audio_source.seek(0)
+
+        if HAVE_PYDUB:
             try:
-                with sf.SoundFile(audio_file, 'r') as f:
+                _rewind_source()
+                pydub_segment = Audio.from_file(audio_source, codec=codec, format=audio_format)
+                sample_rate = pydub_segment.frame_rate
+                num_channels = pydub_segment.channels
+                if offset is not None and offset > 0:
+                    milliseconds = int(offset * 1000)
+                    pydub_segment = pydub_segment[milliseconds:]
+                if duration is not None and duration > 0:
+                    milliseconds = int(duration * 1000)
+                    pydub_segment = pydub_segment[:milliseconds]
+                samples = np.array(pydub_segment.get_array_of_samples())
+                if num_channels > 1:
+                    samples = np.reshape(samples, (-1, num_channels))
+            except CouldntDecodeError as err:
+                if allow_soundfile:
+                    logging.error(
+                        f"Loading {audio_display} via pydub raised CouldntDecodeError: `{err}`. "
+                        f"NeMo will fallback to loading via SoundFile."
+                    )
+                else:
+                    logging.error(
+                        f"Loading {audio_display} via pydub raised CouldntDecodeError: `{err}`. "
+                        f"No SoundFile-compatible fallback is available."
+                    )
+                samples = None
+
+        if samples is None and allow_soundfile:
+            try:
+                _rewind_source()
+                with sf.SoundFile(audio_source, 'r') as f:
                     dtype = 'int32' if int_values else 'float32'
                     sample_rate = f.samplerate
                     if offset is not None and offset > 0:
@@ -345,36 +427,12 @@ class AudioSegment(object):
                     else:
                         samples = f.read(dtype=dtype)
             except RuntimeError as e:
-                logging.error(
-                    f"Loading {audio_file} via SoundFile raised RuntimeError: `{e}`. "
-                    f"NeMo will fallback to loading via pydub."
-                )
-
-                if hasattr(audio_file, "seek"):
-                    audio_file.seek(0)
-
-        if HAVE_PYDUB and samples is None:
-            try:
-                samples = Audio.from_file(audio_file, codec=ffmpeg_codecs.get(os.path.splitext(audio_file)[-1]))
-                sample_rate = samples.frame_rate
-                num_channels = samples.channels
-                if offset is not None and offset > 0:
-                    # pydub does things in milliseconds
-                    seconds = offset * 1000
-                    samples = samples[int(seconds) :]
-                if duration is not None and duration > 0:
-                    seconds = duration * 1000
-                    samples = samples[: int(seconds)]
-                samples = np.array(samples.get_array_of_samples())
-                # For multi-channel signals, channels are stacked in a one-dimensional vector
-                if num_channels > 1:
-                    samples = np.reshape(samples, (-1, num_channels))
-            except CouldntDecodeError as err:
-                logging.error(f"Loading {audio_file} via pydub raised CouldntDecodeError: `{err}`.")
+                logging.error(f"Loading {audio_display} via SoundFile raised RuntimeError: `{e}`.")
+                samples = None
 
         if samples is None:
-            libs = "soundfile, and pydub" if HAVE_PYDUB else "soundfile"
-            raise Exception(f"Your audio file {audio_file} could not be decoded. We tried using {libs}.")
+            libs = ', '.join(tried_libs) if tried_libs else 'no supported backends'
+            raise Exception(f"Your audio file {audio_display} could not be decoded. We tried using {libs}.")
 
         return cls(
             samples,
@@ -512,9 +570,10 @@ class AudioSegment(object):
         :param dtype: data type to load audio as.
         :return: numpy array of samples
         """
+        audio_source, _, _ = _prepare_audio_source(audio_file)
         is_segmented = False
         try:
-            with sf.SoundFile(audio_file, 'r') as f:
+            with sf.SoundFile(audio_source, 'r') as f:
                 sample_rate = f.samplerate
                 if target_sr is not None:
                     n_segments_at_original_sr = math.ceil(n_segments * sample_rate / target_sr)
