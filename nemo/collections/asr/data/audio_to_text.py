@@ -16,6 +16,7 @@ import json
 import math
 import multiprocessing
 import os
+import random
 from collections.abc import Iterable as IterableABC
 from typing import Callable, Dict, Iterable, List, Optional, Tuple, Union
 
@@ -466,6 +467,24 @@ class _AudioTextDataset(Dataset):
         self.trim = trim
         self.return_sample_id = return_sample_id
         self.channel_selector = channel_selector
+        retries_env = os.environ.get('NEMO_ASR_AUDIO_MAX_RETRIES', 3)
+        try:
+            self._audio_retry_attempts = max(1, int(retries_env))
+        except (TypeError, ValueError):
+            logging.warning(
+                f"Invalid NEMO_ASR_AUDIO_MAX_RETRIES value={retries_env}. Falling back to default of 3 attempts."
+            )
+            self._audio_retry_attempts = 3
+
+        fallback_env = os.environ.get('NEMO_ASR_AUDIO_FALLBACK', 'random') or 'random'
+        fallback_value = fallback_env.strip().lower()
+        if fallback_value not in {'random', 'empty'}:
+            logging.warning(
+                f"Invalid NEMO_ASR_AUDIO_FALLBACK value={fallback_env}. Supported values are 'random' and 'empty'. "
+                f"Defaulting to 'random'."
+            )
+            fallback_value = 'random'
+        self._audio_fallback_behavior = fallback_value
 
     def get_manifest_sample(self, sample_id):
         return self.manifest_processor.collection[sample_id]
@@ -477,30 +496,74 @@ class _AudioTextDataset(Dataset):
             return self._process_sample(index)
 
     def _process_sample(self, index):
-        sample = self.manifest_processor.collection[index]
-        offset = sample.offset
+        original_index = index
+        attempted_indices = set()
+        last_error = None
 
-        if offset is None:
-            offset = 0
+        for attempt in range(self._audio_retry_attempts):
+            attempted_indices.add(index)
+            sample = self.manifest_processor.collection[index]
+            offset = sample.offset or 0
 
-        features = self.featurizer.process(
-            sample.audio_file,
-            offset=offset,
-            duration=sample.duration,
-            trim=self.trim,
-            orig_sr=sample.orig_sr,
-            channel_selector=self.channel_selector,
+            try:
+                features = self.featurizer.process(
+                    sample.audio_file,
+                    offset=offset,
+                    duration=sample.duration,
+                    trim=self.trim,
+                    orig_sr=sample.orig_sr,
+                    channel_selector=self.channel_selector,
+                )
+                t, tl = self.manifest_processor.process_text_by_sample(sample=sample)
+                return self._format_output(features, t, tl, index)
+            except Exception as exc:
+                last_error = exc
+                logging.warning(
+                    f"Failed to load audio sample index={index} path={sample.audio_file} on attempt {attempt + 1}/"
+                    f"{self._audio_retry_attempts}: {exc}"
+                )
+                next_index = self._select_alternative_index(attempted_indices)
+                if next_index is None:
+                    break
+                logging.info(f"Retrying audio loading with alternative sample index={next_index}")
+                index = next_index
+
+        logging.error(
+            f"Returning empty sample for original index={original_index} after repeated audio loading failures. "
+            f"Last error: {last_error}"
         )
-        f, fl = features, torch.tensor(features.shape[0]).long()
+        return self._build_empty_output(original_index)
 
-        t, tl = self.manifest_processor.process_text_by_sample(sample=sample)
-
+    def _format_output(self, features, tokens, token_length, sample_index):
+        feature_length = torch.tensor(features.shape[0]).long()
+        tokens_tensor = torch.tensor(tokens).long()
+        token_len_tensor = torch.tensor(token_length).long()
         if self.return_sample_id:
-            output = f, fl, torch.tensor(t).long(), torch.tensor(tl).long(), index
-        else:
-            output = f, fl, torch.tensor(t).long(), torch.tensor(tl).long()
+            return features, feature_length, tokens_tensor, token_len_tensor, sample_index
+        return features, feature_length, tokens_tensor, token_len_tensor
 
-        return output
+    def _build_empty_output(self, sample_index):
+        empty_audio = torch.zeros(0, dtype=torch.float32)
+        empty_audio_length = torch.tensor(0, dtype=torch.long)
+        empty_tokens = torch.zeros(0, dtype=torch.long)
+        empty_token_length = torch.tensor(0, dtype=torch.long)
+        if self.return_sample_id:
+            return empty_audio, empty_audio_length, empty_tokens, empty_token_length, sample_index
+        return empty_audio, empty_audio_length, empty_tokens, empty_token_length
+
+    def _select_alternative_index(self, attempted_indices):
+        if self._audio_fallback_behavior != 'random':
+            return None
+
+        total = len(self.manifest_processor.collection)
+        remaining = total - len(attempted_indices)
+        if remaining <= 0:
+            return None
+
+        while True:
+            candidate = random.randint(0, total - 1)
+            if candidate not in attempted_indices:
+                return candidate
 
     def __len__(self):
         return len(self.manifest_processor.collection)
