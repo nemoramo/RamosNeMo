@@ -9,7 +9,7 @@ from sagemaker import get_execution_role
 from botocore.exceptions import ClientError
 
 # ===== 基本配置 =====
-image_uri = " 457411337639.dkr.ecr.us-east-1.amazonaws.com/sagemaker-studio-mayufeng:nemo-b3-20251120"
+image_uri = "457411337639.dkr.ecr.us-east-1.amazonaws.com/sagemaker-studio-mayufeng:nemo-b3-20251120"
 region = re.search(r"ecr\.([a-z0-9-]+)\.amazonaws\.com", image_uri).group(1)
 boto_sess = boto3.Session(region_name=region)
 sess      = Session(boto_session=boto_sess)
