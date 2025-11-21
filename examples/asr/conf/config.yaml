@@ -21,6 +21,10 @@ model:
     is_tarred: false
     tarred_audio_filepaths: null
     shuffle_n: 2048
+    s3_cache:
+      enabled: true
+      cache_dir: null  # set to a path to pin the cache location; defaults to ~/.cache/nemo/s3
+      size_gb: 500
     # bucketing params
     bucketing_strategy: "synced_randomized"
     bucketing_batch_size: null
@@ -33,6 +37,10 @@ model:
     shuffle: False
     num_workers: 8
     pin_memory: true
+    s3_cache:
+      enabled: true
+      cache_dir: null
+      size_gb: 500
 
   preprocessor:
     _target_: nemo.collections.asr.modules.AudioToMelSpectrogramPreprocessor
