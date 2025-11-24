@@ -49,6 +49,8 @@ TRAIN_MANIFEST       = env("TRAIN_MANIFEST", required=True)
 VAL_MANIFEST         = env("VAL_MANIFEST",   required=True)
 PRETRAINED_FILENAME  = env("PRETRAINED_FILENAME", "parakeet-tdt_ctc-110m.nemo")
 CONFIG_NAME          = env("CONFIG_NAME", "fastconformer_hybrid_tdt_ctc_bpe_110m")
+RUN_NAME             = env("RUN_NAME", "nemo-run")
+LANGUAGE_TAG         = os.environ.get("LANGUAGE", "")
 
 # 训练控制
 DEVICES              = env("DEVICES",            8,  cast=int)
@@ -57,6 +59,9 @@ VAL_CHECK_INTERVAL   = env("VAL_CHECK_INTERVAL", 2000, cast=int)
 RESUME               = env("RESUME",             0,   cast=int)
 MAX_EPOCHS           = env("MAX_EPOCHS",         20,  cast=int)
 MAX_STEPS_ENV        = os.environ.get("MAX_STEPS", "")
+LR                   = env("LR",                 1.0e-3, cast=float)
+EMA_ENABLE           = env("EMA_ENABLE",         1, cast=int)
+EMA_DECAY            = env("EMA_DECAY",          0.999, cast=float)
 
 # 批量与 Loader
 TRAIN_BATCH          = env("TRAIN_BATCH",        "", cast=str)
@@ -119,6 +124,9 @@ def parse_s3_uri(u: str):
     return p.netloc, p.path.lstrip("/")
 
 print("== PRE-FLIGHT (Script Mode) ==")
+if LANGUAGE_TAG:
+    print(f"Language: {LANGUAGE_TAG}")
+print(f"Run name: {RUN_NAME}")
 print("SM_CHANNELS:", {
     "train": CH_TRAIN if CH_TRAIN else "(none - S3 mode?)",
     "val": CH_VAL,
@@ -135,6 +143,8 @@ print("------------------------------------------------\n")
 print("DATA MODES:")
 print(f"  train: is_tarred={bool(TRAIN_IS_TARRED)}  audio_s3={bool(TRAIN_AUDIO_S3)}")
 print(f"  val  : is_tarred={bool(VAL_IS_TARRED)}    audio_s3={bool(VAL_AUDIO_S3)}\n")
+print("OPTIM:")
+print(f"  lr={LR}  ema={'on' if EMA_ENABLE else 'off'}{'' if not EMA_ENABLE else f' decay={EMA_DECAY}'}\n")
 
 # 1) GPU / Torch 检查
 subprocess.run(["nvidia-smi"], check=False)
@@ -420,7 +430,7 @@ args = [
     f"model.validation_ds.manifest_filepath={val_manifest_path}",
     f"model.tokenizer.dir={CH_TOKENIZER}",
 
-    "model.optim.lr=1.0e-3",
+    f"model.optim.lr={LR}",
 
     f"init_from_nemo_model.model0.path={nemo_path}",
     "init_from_nemo_model.model0.exclude=[decoder,joint,aux_ctc]",
@@ -436,8 +446,6 @@ args = [
     f"trainer.accumulate_grad_batches={GRAD_ACCUM}",
 
     "trainer.log_every_n_steps=50",
-    "++exp_manager.ema.enable=True",
-    "++exp_manager.ema.decay=0.999",
 
     "++model.decoding.greedy.loop_labels=false",
     "++model.decoding.greedy.use_cuda_graph_decoder=false", 
@@ -445,6 +453,15 @@ args = [
 
 if MAX_STEPS_ENV and MAX_STEPS_ENV.strip():
     args += [f"trainer.max_steps={MAX_STEPS_ENV.strip()}", "trainer.max_epochs=null"]
+
+# EMA 开关与衰减
+if EMA_ENABLE:
+    args += [
+        "++exp_manager.ema.enable=true",
+        f"++exp_manager.ema.decay={EMA_DECAY}",
+    ]
+else:
+    args += ["++exp_manager.ema.enable=false"]
 
 # Tarred dataset 覆写
 if TRAIN_IS_TARRED:
@@ -496,7 +513,7 @@ args += ["+exp_manager.checkpoint_callback_params.save_last=true"]
 args += [
     "exp_manager.create_tensorboard_logger=true",
     f"exp_manager.exp_dir={TB_DIR}",
-    "exp_manager.name=hausa-en_fastconformer",
+    f"exp_manager.name={RUN_NAME}",
 ]
 
 # 续训策略
