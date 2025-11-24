@@ -27,7 +27,7 @@ from torch.utils.data import ChainDataset
 from tqdm import tqdm
 
 from nemo.collections.asr.parts.preprocessing.features import WaveformFeaturizer
-from nemo.collections.asr.parts.preprocessing.segment import ChannelSelectorType
+from nemo.collections.asr.parts.preprocessing.segment import ChannelSelectorType, configure_s3_cache
 from nemo.collections.asr.parts.preprocessing.segment import available_formats as valid_sf_formats
 from nemo.collections.common import tokenizers
 from nemo.collections.common.parts.preprocessing import collections, parsers
@@ -414,6 +414,8 @@ class _AudioTextDataset(Dataset):
         pad_id: Id of pad symbol. Defaults to 0
         return_sample_id (bool): whether to return the sample_id as a part of each sample
         channel_selector (int | Iterable[int] | str): select a single channel or a subset of channels from multi-channel audio. If set to `'average'`, it performs averaging across channels. Disabled if set to `None`. Defaults to `None`. Uses zero-based indexing.
+        s3_cache_config (Optional[dict]): Configure disk-backed S3 cache. Keys: `enabled` (bool),
+            `cache_dir` (str), `size_gb` (int). If omitted, environment variables control caching.
         manifest_parse_func: Optional function to parse manifest entries. Defaults to None.
     """
 
@@ -445,12 +447,14 @@ class _AudioTextDataset(Dataset):
         return_sample_id: bool = False,
         channel_selector: Optional[ChannelSelectorType] = None,
         manifest_parse_func: Optional[Callable] = None,
+        s3_cache_config: Optional[Dict[str, Union[str, int, bool]]] = None,
     ):
         if type(manifest_filepath) == str:
             manifest_filepath = manifest_filepath.split(",")
 
         # If necessary, cache manifests and audio from object store
         cache_datastore_manifests(manifest_filepaths=manifest_filepath, cache_audio=True)
+        self._configure_s3_cache(s3_cache_config)
 
         self.manifest_processor = ASRManifestProcessor(
             manifest_filepath=manifest_filepath,
@@ -485,6 +489,21 @@ class _AudioTextDataset(Dataset):
             )
             fallback_value = 'random'
         self._audio_fallback_behavior = fallback_value
+
+    def _configure_s3_cache(self, s3_cache_config: Optional[Dict[str, Union[str, int, bool]]]):
+        if s3_cache_config is None:
+            return
+
+        enabled = s3_cache_config.get('enabled', True)
+        disable = s3_cache_config.get('disable', None)
+        if disable is None:
+            disable = not enabled
+
+        configure_s3_cache(
+            cache_dir=s3_cache_config.get('cache_dir', None),
+            size_gb=s3_cache_config.get('size_gb', None),
+            disable=disable,
+        )
 
     def get_manifest_sample(self, sample_id):
         return self.manifest_processor.collection[sample_id]
@@ -603,6 +622,8 @@ class AudioToCharDataset(_AudioTextDataset):
         eos_id: Id of end of sequence symbol to append if not None
         return_sample_id (bool): whether to return the sample_id as a part of each sample
         channel_selector (int | Iterable[int] | str): select a single channel or a subset of channels from multi-channel audio. If set to `'average'`, it performs averaging across channels. Disabled if set to `None`. Defaults to `None`. Uses zero-based indexing.
+        s3_cache_config (Optional[dict]): Configure disk-backed S3 cache. Keys: `enabled` (bool),
+            `cache_dir` (str), `size_gb` (int). If omitted, environment variables control caching.
         manifest_parse_func: Optional function to parse manifest entries. Defaults to None.
     """
 
@@ -638,6 +659,7 @@ class AudioToCharDataset(_AudioTextDataset):
         return_sample_id: bool = False,
         channel_selector: Optional[ChannelSelectorType] = None,
         manifest_parse_func: Optional[Callable] = None,
+        s3_cache_config: Optional[Dict[str, Union[str, int, bool]]] = None,
     ):
         self.labels = labels
 
@@ -660,6 +682,7 @@ class AudioToCharDataset(_AudioTextDataset):
             pad_id=pad_id,
             return_sample_id=return_sample_id,
             channel_selector=channel_selector,
+            s3_cache_config=s3_cache_config,
             manifest_parse_func=manifest_parse_func,
         )
 
@@ -699,6 +722,8 @@ class AudioToBPEDataset(_AudioTextDataset):
             tokens to beginning and ending of speech respectively.
         return_sample_id (bool): whether to return the sample_id as a part of each sample
         channel_selector (int | Iterable[int] | str): select a single channel or a subset of channels from multi-channel audio. If set to `'average'`, it performs averaging across channels. Disabled if set to `None`. Defaults to `None`. Uses zero-based indexing.
+        s3_cache_config (Optional[dict]): Configure disk-backed S3 cache. Keys: `enabled` (bool),
+            `cache_dir` (str), `size_gb` (int). If omitted, environment variables control caching.
         manifest_parse_func: Optional function to parse manifest entries. Defaults to None.
     """
 
@@ -728,6 +753,7 @@ class AudioToBPEDataset(_AudioTextDataset):
         return_sample_id: bool = False,
         channel_selector: Optional[ChannelSelectorType] = None,
         manifest_parse_func: Optional[Callable] = None,
+        s3_cache_config: Optional[Dict[str, Union[str, int, bool]]] = None,
     ):
         if use_start_end_token and hasattr(tokenizer, "bos_id") and tokenizer.bos_id > 0:
             bos_id = tokenizer.bos_id
@@ -777,6 +803,7 @@ class AudioToBPEDataset(_AudioTextDataset):
             trim=trim,
             return_sample_id=return_sample_id,
             channel_selector=channel_selector,
+            s3_cache_config=s3_cache_config,
             manifest_parse_func=manifest_parse_func,
         )
 
