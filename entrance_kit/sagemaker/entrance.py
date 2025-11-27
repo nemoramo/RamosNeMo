@@ -20,6 +20,7 @@ from sagemaker.session import Session
 # entrance.py
 
 # ===== 基本配置 =====
+THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 image_uri = "457411337639.dkr.ecr.us-east-1.amazonaws.com/sagemaker-studio-mayufeng:nemo-b3-20251120"
 region = re.search(r"ecr\.([a-z0-9-]+)\.amazonaws\.com", image_uri).group(1)
 boto_sess = boto3.Session(region_name=region)
@@ -416,7 +417,7 @@ tb_cfg = TensorBoardOutputConfig(
 est = PyTorch(
     image_uri=image_uri,
     entry_point="train_entry.py",
-    source_dir=".",
+    source_dir=THIS_DIR,
     role=role,
     instance_count=1,
     instance_type=INSTANCE_TYPE,
