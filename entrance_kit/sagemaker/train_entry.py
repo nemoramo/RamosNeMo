@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
 import os, sys, json, subprocess, random, time
+from pathlib import Path
 from urllib.parse import urlparse
 
-# --- 兜底：确保优先导入 /opt/nemo ---
+# --- 兜底：确保优先导入 /opt/nemo 和本仓库根目录 ---
 _p = "/opt/nemo"
 if os.path.isdir(_p) and _p not in sys.path:
     sys.path.insert(0, _p)
+REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 def env(name, default=None, required=False, cast=str):
     v = os.environ.get(name, default)
@@ -18,6 +22,20 @@ def env(name, default=None, required=False, cast=str):
         except Exception:
             pass
     return v
+
+def resolve_nemo_entry():
+    """Resolve training script and config paths (prefer repo copy, fallback to /opt/nemo)."""
+    repo_script = REPO_ROOT / "examples" / "asr" / "asr_hybrid_transducer_ctc" / "speech_to_text_hybrid_rnnt_ctc_bpe.py"
+    repo_cfg_dir = REPO_ROOT / "examples" / "asr" / "conf" / "fastconformer" / "hybrid_transducer_ctc"
+    if repo_script.is_file():
+        return str(repo_script), str(repo_cfg_dir)
+
+    fallback_script = Path("/opt/nemo/examples/asr/asr_hybrid_transducer_ctc/speech_to_text_hybrid_rnnt_ctc_bpe.py")
+    fallback_cfg = Path("/opt/nemo/examples/asr/conf/fastconformer/hybrid_transducer_ctc")
+    if fallback_script.is_file():
+        return str(fallback_script), str(fallback_cfg)
+
+    raise SystemExit("Cannot locate NeMo training entry script (looked under repo and /opt/nemo)")
 
 # === 数据模式相关 env ===
 TRAIN_AUDIO_S3        = env("TRAIN_AUDIO_S3", 0, cast=int)
@@ -42,7 +60,8 @@ CH_TOKENIZER  = env("SM_CHANNEL_TOKENIZER",  required=True)
 CH_PRETRAINED = env("SM_CHANNEL_PRETRAINED", required=True)
 MODEL_DIR     = env("SM_MODEL_DIR",          required=True)
 OUT_DIR       = env("SM_OUTPUT_DATA_DIR",    required=True)
-TB_DIR        = os.path.join("/opt/ml/output", "tensorboard")
+OUTPUT_BASE   = os.environ.get("OUTPUT_BASE_DIR", "/opt/ml/output")
+TB_DIR        = os.path.join(OUTPUT_BASE, "tensorboard")
 
 # 训练/评估文件名
 TRAIN_MANIFEST       = env("TRAIN_MANIFEST", required=True)
@@ -173,7 +192,7 @@ if TRAIN_AUDIO_S3:
     if not TRAIN_MANIFEST_S3_URI:
         print("[X] TRAIN_AUDIO_S3=1 但 TRAIN_MANIFEST_S3_URI 为空")
         sys.exit(2)
-    train_manifest_dir = "/opt/ml/input/data/train_s3"
+    train_manifest_dir = os.environ.get("TRAIN_MANIFEST_LOCAL_DIR", "/opt/ml/input/data/train_s3")
     train_manifest_path = os.path.join(train_manifest_dir, TRAIN_MANIFEST)
     train_manifest_path = obtain_manifest(train_manifest_path, TRAIN_MANIFEST_S3_URI)
     train_base_dir = train_manifest_dir
@@ -302,7 +321,7 @@ subprocess.check_call([sys.executable, "-c", py])
 
 # 6) Checkpoint 目录
 TS = time.strftime("%Y%m%d-%H%M%S", time.localtime())
-CKPT_BASE = "/opt/ml/checkpoints"
+CKPT_BASE = os.environ.get("CHECKPOINT_BASE_DIR", "/opt/ml/checkpoints")
 CKPT_DIR_TS = os.path.join(CKPT_BASE, f"ts-{TS}")
 os.makedirs(CKPT_DIR_TS, exist_ok=True)
 
@@ -419,10 +438,10 @@ print(f"[valid] enabled={bool(AUG_ON_VAL)} | "
 print("== PRE-FLIGHT PASSED ==\n")
 
 # 8) 组装 Hydra 覆写并启动 NeMo 训练
-nemo_script = "/opt/nemo/examples/asr/asr_hybrid_transducer_ctc/speech_to_text_hybrid_rnnt_ctc_bpe.py"
+nemo_script, nemo_cfg_dir = resolve_nemo_entry()
 args = [
     sys.executable, nemo_script,
-    "--config-path=/opt/nemo/examples/asr/conf/fastconformer/hybrid_transducer_ctc",
+    f"--config-path={nemo_cfg_dir}",
     f"--config-name={CONFIG_NAME}",
 
     # 数据路径（train/val manifest 使用我们刚刚准备好的本地路径）
