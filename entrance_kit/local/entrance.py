@@ -61,9 +61,12 @@ def main():
     tokenizer_dir = Path(args.tokenizer_dir).expanduser().resolve()
     pretrained = Path(args.pretrained).expanduser().resolve()
 
+    missing_paths = []
     for required_path in [train_manifest, val_manifest, tokenizer_dir, pretrained]:
         if not required_path.exists():
-            raise SystemExit(f"Path not found: {required_path}")
+            missing_paths.append(str(required_path))
+    if missing_paths:
+        raise SystemExit(f"The following required paths were not found: {', '.join(missing_paths)}")
 
     out_root = Path(args.out).resolve()
     model_dir = out_root / "model"
