@@ -18,6 +18,7 @@ import time
 from io import BytesIO
 from pathlib import Path
 from typing import List, Optional, Tuple
+import logging as _py_logging
 
 import boto3
 import botocore
@@ -27,6 +28,10 @@ from tenacity import before_sleep_log, retry, retry_if_exception, stop_after_del
 
 from nemo.utils import logging
 from nemo.utils.s3_dirpath_utils import build_s3_url, is_s3_url
+
+# Suppress boto3 and botocore noisy logs (e.g. "Found credentials in ...")
+_py_logging.getLogger('boto3').setLevel(_py_logging.WARNING)
+_py_logging.getLogger('botocore').setLevel(_py_logging.WARNING)
 
 try:
     import awscrt
