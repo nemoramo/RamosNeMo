@@ -39,7 +39,9 @@ class ManifestEN:
 
 
 def item_iter(
-    manifests_files: Union[str, List[str]], parse_func: Callable[[str, Optional[str]], Dict[str, Any]] = None
+    manifests_files: Union[str, List[str]],
+    parse_func: Callable[[str, Optional[str]], Dict[str, Any]] = None,
+    use_polars: bool = False,
 ) -> Iterator[Dict[str, Any]]:
     """Iterate through json lines of provided manifests.
 
@@ -58,6 +60,11 @@ def item_iter(
             of a manifest and optionally the manifest file itself,
             and parses it, returning a dictionary mapping from str -> Any.
 
+        use_polars: When True, load the manifest via Polars instead of Python
+            line-by-line parsing. Only supports standard ASR fields
+            (audio_filepath/audio_filename, duration, text, optional offset).
+            If Polars is unavailable, an ImportError is raised.
+
     Yields:
         Parsed key to value item dicts.
 
@@ -70,6 +77,10 @@ def item_iter(
 
     if parse_func is None:
         parse_func = __parse_item
+
+    if use_polars:
+        yield from _item_iter_polars(manifests_files, parse_func=parse_func)
+        return
 
     errors = defaultdict(list)
     k = -1
@@ -183,6 +194,166 @@ def __parse_item(line: str, manifest_file: str) -> Dict[str, Any]:
         text=item['text'],
         rttm_file=item['rttm_file'],
         feature_file=item['feature_file'],
+        offset=item.get('offset', None),
+        speaker=item.get('speaker', None),
+        orig_sr=item.get('orig_sample_rate', None),
+        token_labels=item.get('token_labels', None),
+        lang=item.get('lang', None),
+        context=item.get('context', None),
+        context_type=item.get('context_type', None),
+        context_duration=item.get('context_duration', None),
+        answer=item.get('answer', None),
+        answer_type=item.get('answer_type', None),
+        answer_duration=item.get('answer_duration', None),
+        question=item.get('question', None),
+        question_type=item.get('question_type', None),
+        task=item.get('task', None),
+    )
+    return item
+
+
+def _item_iter_polars(
+    manifests_files: Union[str, List[str]], parse_func: Callable[[str, Optional[str]], Dict[str, Any]]
+) -> Iterator[Dict[str, Any]]:
+    """Polars-backed manifest iterator (simple fields only)."""
+    try:
+        import polars as pl
+    except ImportError as exc:
+        raise ImportError(
+            "use_polars=True but polars is not installed. Install polars or set use_polars=false."
+        ) from exc
+
+    if isinstance(manifests_files, str):
+        manifests_files = [manifests_files]
+
+    errors = defaultdict(list)
+    k = -1
+    logging.debug('Manifest files (polars): %s', str(manifests_files))
+    for manifest_file in manifests_files:
+        logging.debug('Using manifest file (polars): %s', str(manifest_file))
+        cached_manifest_file = DataStoreObject(manifest_file).get()
+        logging.debug('Cached at: %s', str(cached_manifest_file))
+
+        try:
+            df = pl.read_ndjson(cached_manifest_file)
+        except Exception as exc:
+            logging.error(f"pl.read_ndjson failed for {cached_manifest_file}: {exc}")
+            # Fallback to eager read_json if ndjson fails
+            df = pl.read_json(cached_manifest_file)
+
+        # Optional progress bar
+        try:
+            from tqdm.auto import tqdm
+
+            row_iter = tqdm(
+                df.iter_rows(named=True),
+                total=len(df),
+                desc=f"manifest (polars): {os.path.basename(manifest_file)}",
+        except Exception as exc:
+            logging.warning(f"Could not import or initialize tqdm progress bar: {exc}. Falling back to plain iterator.")
+        except Exception:
+            row_iter = df.iter_rows(named=True)
+
+        for row in row_iter:
+                if getattr(parse_func, "__name__", None) == "__parse_item":
+            try:
+                if parse_func is __parse_item:
+                    item = __parse_item_from_row(row, manifest_file)
+                else:
+                    # Preserve compatibility: send json string to custom parse_func
+                    item = parse_func(json.dumps(row), manifest_file)
+            except Exception as exc:
+                errors[str(manifest_file)].append(f"{exc}: {row}")
+                continue
+
+            item['id'] = k
+            yield item
+
+    if len(errors) > 0:
+        for filename, lines in errors.items():
+            logging.error("=============================================")
+            logging.error(f"Failed to parse {len(lines)} lines from manifest file: {filename}")
+            for line in lines:
+                logging.error(f"-- Failed to parse line: `{line}`")
+        raise RuntimeError("Failed to parse some lines from manifest files. See logs for more details.")
+
+
+def __parse_item_from_row(row: Dict[str, Any], manifest_file: str) -> Dict[str, Any]:
+    """Fast-path parse when the manifest is already materialized as a dict (e.g., via Polars)."""
+    item = dict(row)
+
+    # Audio file
+    if 'audio_filename' in item:
+        item['audio_file'] = item.pop('audio_filename')
+    elif 'audio_filepath' in item:
+        item['audio_file'] = item.pop('audio_filepath')
+    elif 'context' in item and 'audio_file' not in item:
+        item['audio_file'] = item['context']
+
+    # Video File
+    if 'video_filename' in item:
+        item['video_file'] = item.pop('video_filename')
+    elif 'video_filepath' in item:
+        item['video_file'] = item.pop('video_filepath')
+
+    if 'video_file' not in item and 'audio_file' not in item:
+        raise ValueError(
+            f"Manifest file {manifest_file} has invalid json line structure (missing audio/video filepath). Row: {row}"
+        )
+
+    if 'audio_file' in item:
+        item['audio_file'] = get_full_path(audio_file=item['audio_file'], manifest_file=manifest_file)
+    if 'video_file' in item:
+        item['video_file'] = get_full_path(audio_file=item['video_file'], manifest_file=manifest_file)
+
+    # Duration.
+    if 'context_duration' in item and 'duration' not in item:
+        item['duration'] = item['context_duration']
+    elif 'duration' not in item:
+        raise ValueError(
+            f"Manifest file {manifest_file} has invalid json line structure (missing duration). Row: {row}"
+        )
+
+        # 'text' is already present in item; nothing to do.
+    if 'text' in item:
+        pass
+    elif 'text_filepath' in item:
+        with open(item.pop('text_filepath'), 'r') as f:
+            item['text'] = f.read().replace('\n', '')
+    elif 'normalized_text' in item:
+        item['text'] = item['normalized_text']
+    else:
+        item['text'] = ""
+
+    # Optional RTTM file
+    rttm_file = None
+    if 'rttm_file' in item:
+        rttm_file = item.pop('rttm_file')
+    elif 'rttm_filename' in item:
+        rttm_file = item.pop('rttm_filename')
+    elif 'rttm_filepath' in item:
+        rttm_file = item.pop('rttm_filepath')
+    if rttm_file is not None:
+        rttm_file = get_full_path(audio_file=rttm_file, manifest_file=manifest_file)
+
+    # Optional audio feature file
+    feature_file = None
+    if 'feature_file' in item:
+        feature_file = item.pop('feature_file')
+    elif 'feature_filename' in item:
+        feature_file = item.pop('feature_filename')
+    elif 'feature_filepath' in item:
+        feature_file = item.pop('feature_filepath')
+    if feature_file is not None:
+        feature_file = get_full_path(audio_file=feature_file, manifest_file=manifest_file)
+
+    item = dict(
+        audio_file=item.get('audio_file', None),
+        video_file=item.get('video_file', None),
+        duration=item['duration'],
+        text=item['text'],
+        rttm_file=rttm_file,
+        feature_file=feature_file,
         offset=item.get('offset', None),
         speaker=item.get('speaker', None),
         orig_sr=item.get('orig_sample_rate', None),

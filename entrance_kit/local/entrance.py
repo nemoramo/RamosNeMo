@@ -10,6 +10,7 @@ def parse_args():
     p = argparse.ArgumentParser(description="Local launcher that mirrors the SageMaker entrance.")
     p.add_argument("--train-manifest", required=True, help="Absolute path to train manifest (jsonl).")
     p.add_argument("--val-manifest", required=True, help="Absolute path to val manifest (jsonl).")
+    p.add_argument("--test-manifest", default="", help="Optional path to test manifest (jsonl).")
     p.add_argument("--tokenizer-dir", required=True, help="Tokenizer directory.")
     p.add_argument("--pretrained", required=True, help="Path to pretrained .nemo file.")
     p.add_argument("--config-name", default="fastconformer_hybrid_tdt_ctc_bpe_110m")
@@ -22,6 +23,8 @@ def parse_args():
     p.add_argument("--num-workers", type=int, default=8)
     p.add_argument("--train-bsz", type=int, default=32)
     p.add_argument("--val-bsz", type=int, default=32)
+    p.add_argument("--test-bsz", type=int, default=32)
+    p.add_argument("--test-num-workers", type=int, default=8)
     p.add_argument("--max-epochs", type=int, default=20)
     p.add_argument("--max-steps", default="")
     p.add_argument("--val-check-interval", type=int, default=2000)
@@ -45,6 +48,17 @@ def parse_args():
     p.add_argument("--sample-k", type=int, default=64)
     p.add_argument("--ckpt-every-steps", type=int, default=0)
     p.add_argument("--ckpt-every-epochs", type=int, default=0)
+    p.add_argument("--use-lhotse", action="store_true", help="Force use_lhotse=true for train/val/test.")
+    p.add_argument("--train-batch-duration", default="", help="Lhotse max batch duration for train set.")
+    p.add_argument("--val-batch-duration", default="", help="Lhotse max batch duration for val set.")
+    p.add_argument("--test-batch-duration", default="", help="Lhotse max batch duration for test set.")
+    p.add_argument("--use-polars", action="store_true", help="Enable Polars-based manifest reading (non-Lhotse).")
+    p.add_argument(
+        "--pretokenize",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Whether to pretokenize manifests at load time (default: true).",
+    )
     return p.parse_args()
 
 
@@ -58,11 +72,15 @@ def main():
 
     train_manifest = Path(args.train_manifest).expanduser().resolve()
     val_manifest = Path(args.val_manifest).expanduser().resolve()
+    test_manifest = Path(args.test_manifest).expanduser().resolve() if args.test_manifest else None
     tokenizer_dir = Path(args.tokenizer_dir).expanduser().resolve()
     pretrained = Path(args.pretrained).expanduser().resolve()
 
     missing_paths = []
-    for required_path in [train_manifest, val_manifest, tokenizer_dir, pretrained]:
+    reqs = [train_manifest, val_manifest, tokenizer_dir, pretrained]
+    if test_manifest:
+        reqs.append(test_manifest)
+    for required_path in reqs:
         if not required_path.exists():
             missing_paths.append(str(required_path))
     if missing_paths:
@@ -84,6 +102,7 @@ def main():
         {
             "SM_CHANNEL_TRAIN": str(train_manifest.parent),
             "SM_CHANNEL_VAL": str(val_manifest.parent),
+            "SM_CHANNEL_TEST": str(test_manifest.parent) if test_manifest else "",
             "SM_CHANNEL_TOKENIZER": str(tokenizer_dir),
             "SM_CHANNEL_PRETRAINED": str(pretrained.parent),
             "SM_MODEL_DIR": str(model_dir),
@@ -93,6 +112,7 @@ def main():
             "TRAIN_MANIFEST_LOCAL_DIR": str(train_s3_dir),
             "TRAIN_MANIFEST": train_manifest.name,
             "VAL_MANIFEST": val_manifest.name,
+            "TEST_MANIFEST": test_manifest.name if test_manifest else "",
             "PRETRAINED_FILENAME": pretrained.name,
             "CONFIG_NAME": args.config_name,
             "RUN_NAME": args.run_name,
@@ -101,9 +121,11 @@ def main():
             "PRECISION": args.precision,
             "GRAD_ACCUM": str(args.grad_accum),
             "NUM_WORKERS": str(args.num_workers),
+            "TEST_NUM_WORKERS": str(args.test_num_workers),
             "AUTO_BATCH_PER_GPU": str(int(bool(args.auto_batch_per_gpu))),
             "TRAIN_BATCH": str(args.train_bsz),
             "VAL_BATCH": str(args.val_bsz),
+            "TEST_BATCH": str(args.test_bsz),
             "MAX_EPOCHS": str(args.max_epochs),
             "MAX_STEPS": args.max_steps,
             "VAL_CHECK_INTERVAL": str(args.val_check_interval),
@@ -126,6 +148,12 @@ def main():
             "SAMPLE_K": str(args.sample_k),
             "CKPT_EVERY_STEPS": str(args.ckpt_every_steps),
             "CKPT_EVERY_EPOCHS": str(args.ckpt_every_epochs),
+            "USE_LHOTSE": "1" if args.use_lhotse else "0",
+            "BATCH_DURATION_TRAIN": args.train_batch_duration,
+            "BATCH_DURATION_VAL": args.val_batch_duration,
+            "BATCH_DURATION_TEST": args.test_batch_duration,
+            "USE_POLARS": "1" if args.use_polars else "0",
+            "PRETOKENIZE": "1" if args.pretokenize else "0",
             "S3_OUT": "",
             "S3_TB": "",
             "S3_CKPT": "",

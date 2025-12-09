@@ -1,0 +1,10 @@
+FROM nvcr.io/nvidia/nemo:25.11
+SHELL ["/bin/bash", "-lc"]
+WORKDIR /workspace/RamosNeMo
+COPY . .
+RUN pip install --upgrade pip setuptools wheel && \
+    pip install -e ".[asr,audio]"
+ENV NUMBA_CUDA_ENABLE_MINOR_VERSION_COMPATIBILITY=1
+ENV NUMBA_CUDA_USE_NVIDIA_BINDINGS=1
+ENV LD_PRELOAD=/opt/venv/lib/libittnotify.so
+ENTRYPOINT ["/bin/bash"]

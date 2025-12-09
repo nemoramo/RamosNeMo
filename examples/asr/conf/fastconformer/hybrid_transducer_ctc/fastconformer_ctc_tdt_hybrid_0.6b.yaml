@@ -1,0 +1,236 @@
+# Fast Conformer CTC + TDT hybrid (~0.6B) using Parakeet-TDT-0.6b-v3 encoder init
+# Multi-task: primary TDT (RNNT) loss + auxiliary CTC losses at top encoder blocks.
+
+name: "FastConformer-CTC-TDT-Hybrid-0.6B"
+
+init_from_nemo_model:
+  model0:
+    path: /data1/mayufeng/.cache/huggingface/hub/models--nvidia--parakeet-tdt-0.6b-v3/snapshots/6d590f77001d318fb17a0b5bf7ee329a91b52598/parakeet-tdt-0.6b-v3.nemo
+    include: ["preprocessor", "encoder"]
+    exclude: ["decoder", "joint", "aux_ctc"]  # allow overrides (e.g., decoder/joint/aux_ctc) from launcher
+
+model:
+  sample_rate: 16000
+  log_prediction: true
+  rnnt_reduction: mean_volume  # TDT loss
+  skip_nan_grad: false
+
+  model_defaults:
+    enc_hidden: ${model.encoder.d_model}
+    pred_hidden: 640
+    joint_hidden: 640
+    tdt_durations: [0, 1, 2, 3, 4]
+    num_tdt_durations: 5
+
+  train_ds:
+    manifest_filepath: ???
+    sample_rate: ${model.sample_rate}
+    batch_size: 16
+    shuffle: true
+    num_workers: 8
+    pin_memory: true
+    use_distributed_sampler: true
+    max_duration: 30.0
+    min_duration: 0.1
+    use_lhotse: false
+    bucket_batch_size: null
+    bucket_buffer_size: 20000
+    shuffle_buffer_size: 10000
+
+  validation_ds:
+    manifest_filepath: ???
+    sample_rate: ${model.sample_rate}
+    batch_size: 8
+    shuffle: false
+    num_workers: 4
+    pin_memory: true
+    use_distributed_sampler: true
+    use_lhotse: false
+
+  test_ds:
+    manifest_filepath: ???
+    sample_rate: ${model.sample_rate}
+    batch_size: 8
+    shuffle: false
+    num_workers: 4
+    pin_memory: true
+    use_distributed_sampler: true
+    use_lhotse: false
+
+  tokenizer:
+    dir: ???  # path to parakeet 8k SentencePiece tokenizer
+    type: bpe
+
+  preprocessor:
+    _target_: nemo.collections.asr.modules.AudioToMelSpectrogramPreprocessor
+    sample_rate: ${model.sample_rate}
+    normalize: per_feature
+    window_size: 0.025
+    window_stride: 0.01
+    window: hann
+    features: 128
+    n_fft: 512
+    log: true
+    frame_splicing: 1
+    dither: 1.0e-05
+    pad_to: 0
+    pad_value: 0.0
+
+  spec_augment:
+    _target_: nemo.collections.asr.modules.SpectrogramAugmentation
+    freq_masks: 2
+    time_masks: 10
+    freq_width: 27
+    time_width: 0.05
+
+  encoder:
+    _target_: nemo.collections.asr.modules.ConformerEncoder
+    feat_in: ${model.preprocessor.features}
+    feat_out: -1
+    n_layers: 24
+    d_model: 1024
+    use_bias: false
+    subsampling: dw_striding
+    subsampling_factor: 8
+    subsampling_conv_channels: 256
+    causal_downsampling: false
+    ff_expansion_factor: 4
+    self_attention_model: rel_pos
+    n_heads: 8
+    att_context_size: [-1, -1]
+    att_context_style: regular
+    xscaling: false
+    untie_biases: true
+    pos_emb_max_len: 5000
+    conv_kernel_size: 9
+    conv_norm_type: batch_norm
+    conv_context_size: null
+    dropout: 0.1
+    dropout_pre_encoder: 0.1
+    dropout_emb: 0.0
+    dropout_att: 0.1
+    stochastic_depth_drop_prob: 0.0
+    stochastic_depth_mode: linear
+    stochastic_depth_start_layer: 1
+
+  decoder:
+    _target_: nemo.collections.asr.modules.RNNTDecoder
+    normalization_mode: null
+    random_state_sampling: false
+    blank_as_pad: true
+    prednet:
+      pred_hidden: 640
+      pred_rnn_layers: 2
+      t_max: null
+      dropout: 0.2
+    vocab_size: -1  # auto-set from tokenizer
+
+  joint:
+    _target_: nemo.collections.asr.modules.RNNTJoint
+    log_softmax: null
+    preserve_memory: false
+    fuse_loss_wer: true
+    fused_batch_size: 4
+    jointnet:
+      joint_hidden: 640
+      activation: relu
+      dropout: 0.2
+      encoder_hidden: 1024
+      pred_hidden: 640
+    num_extra_outputs: 5
+    num_classes: -1  # auto-set from tokenizer
+    vocabulary: null  # filled from tokenizer during setup
+
+  decoding:
+    strategy: greedy_batch  # greedy, greedy_batch, beam, tsd, alsd
+    model_type: tdt
+    durations: ${model.model_defaults.tdt_durations}
+    greedy:
+      max_symbols: 10
+    beam:
+      beam_size: 2
+      return_best_hypothesis: false
+      score_norm: true
+      tsd_max_sym_exp: 50
+      alsd_max_target_len: 2.0
+    loop_labels: false
+    use_cuda_graph_decoder: false
+
+  # Auxiliary CTC heads on top encoder layers (hybrid training)
+  interctc:
+    apply_at_layers: [18, 22]  # layer 24 does not exist in this 24-layer encoder
+    loss_weights: [0.15, 0.15]   # keep total CTC weight 0.3 vs TDT 0.7
+
+  aux_ctc:
+    ctc_loss_weight: 0.3
+    use_cer: false
+    ctc_reduction: mean_batch
+    decoder:
+      _target_: nemo.collections.asr.modules.ConvASRDecoder
+      feat_in: null
+      num_classes: -1
+      vocabulary: []
+    decoding:
+      strategy: greedy
+
+  loss:
+    loss_name: tdt
+    tdt_kwargs:
+      fastemit_lambda: 0.0
+      clamp: -1.0
+      durations: ${model.model_defaults.tdt_durations}
+      sigma: 0.02
+      omega: 0.1
+
+  optim:
+    name: adamw
+    lr: 4e-4
+    betas: [0.9, 0.98]
+    weight_decay: 1e-3
+    sched:
+      name: CosineAnnealing
+      max_steps: 200000
+      warmup_steps: 10000
+      min_lr: 1e-6
+
+trainer:
+  devices: -1
+  num_nodes: 1
+  max_epochs: 1000
+  max_steps: -1
+  val_check_interval: 1.0
+  accelerator: auto
+  use_distributed_sampler: true
+  strategy:
+    _target_: lightning.pytorch.strategies.DDPStrategy
+    gradient_as_bucket_view: true
+  accumulate_grad_batches: 1
+  gradient_clip_val: 0.0
+  limit_test_batches: 0
+  precision: 16
+  log_every_n_steps: 10
+  enable_progress_bar: true
+  num_sanity_val_steps: 0
+  check_val_every_n_epoch: 1
+  sync_batchnorm: true
+  enable_checkpointing: false
+  logger: false
+  benchmark: false
+
+exp_manager:
+  exp_dir: null
+  name: ${name}
+  create_tensorboard_logger: true
+  create_checkpoint_callback: true
+  checkpoint_callback_params:
+    monitor: "val_wer"
+    mode: "min"
+    save_top_k: 3
+    always_save_nemo: true
+  resume_from_checkpoint: null
+  resume_if_exists: false
+  resume_ignore_no_checkpoint: false
+  create_wandb_logger: false
+  wandb_logger_kwargs:
+    name: null
+    project: null

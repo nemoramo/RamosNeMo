@@ -160,6 +160,8 @@ def get_char_dataset(config: dict, augmentor: Optional['AudioAugmentor'] = None)
         return_sample_id=config.get('return_sample_id', False),
         channel_selector=config.get('channel_selector', None),
         s3_cache_config=config.get('s3_cache', None),
+        use_polars=config.get('use_polars', False),
+        pretokenize=config.get('pretokenize', True),
     )
     return dataset
 
@@ -241,6 +243,8 @@ def get_bpe_dataset(
         return_sample_id=config.get('return_sample_id', False),
         channel_selector=config.get('channel_selector', None),
         s3_cache_config=config.get('s3_cache', None),
+        use_polars=config.get('use_polars', False),
+        pretokenize=config.get('pretokenize', True),
     )
     return dataset
 

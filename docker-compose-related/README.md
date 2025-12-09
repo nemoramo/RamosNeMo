@@ -1,0 +1,38 @@
+# RamosNeMo docker-compose quickstart
+
+## 启动容器
+```bash
+cd RamosNeMo/docker-compose-related
+docker compose -f docker-compose.yml build nemo-training
+docker compose -f docker-compose.yml up -d nemo-training
+```
+
+进入容器：
+```bash
+docker compose -f docker-compose.yml exec -it nemo-training bash
+# 或者直接用容器名（默认 projects-nemo-training-1）
+docker exec -it projects-nemo-training-1 bash
+```
+
+## 训练示例命令
+容器内执行（使用挂载的代码和数据）：
+```bash
+python /opt/ramosnemo_source/entrance_kit/local/entrance.py \
+  --config-name fastconformer_ctc_tdt_hybrid_0.6b \
+  --train-manifest /data2/mayufeng/swahili/swahili_v6_plus.filtered.filtered.abs.manifest \
+  --val-manifest /data2/mayufeng/nemo_val/nemo_val_test/swahili_returndata.abs.manifest.exists \
+  --tokenizer-dir /data1/mayufeng/tokenizer_2048_swa/tokenizer_spe_bpe_v2048 \
+  --pretrained /data1/mayufeng/.cache/huggingface/hub/models--nvidia--parakeet-tdt-0.6b-v3/snapshots/6d590f77001d318fb17a0b5bf7ee329a91b52598/parakeet-tdt-0.6b-v3.nemo \
+  --language swahili \
+  --out /data2/mayufeng/nemo_exps/swahili_0.6b_v6plus \
+  --run-name swahili-0.6b-v6plus \
+  --devices 8 --precision bf16 --train-bsz 32 --val-bsz 32 \
+  --max-epochs 30 --ckpt-every-steps 5000 --val-check-interval 2000
+```
+
+要按步数存 checkpoint：`--ckpt-every-steps 5000`。  
+要调整验证频率：`--val-check-interval <steps>`（默认为 2000）。  
+
+## 挂载与依赖
+- `/data1`, `/data2` 挂载到容器内同路径；`../RamosNeMo` 挂载到 `/opt/ramosnemo_source`。  
+- Dockerfile 已安装 `ffmpeg`，启动时 `/opt/setup_ramosnemo.sh` 会 `pip install -e /opt/ramosnemo_source`。 

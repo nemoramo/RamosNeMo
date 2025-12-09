@@ -141,9 +141,13 @@ class ASRManifestProcessor:
         eos_id: Optional[int] = None,
         pad_id: int = 0,
         index_by_file_id: bool = False,
+        use_polars: bool = False,
+        pretokenize: bool = True,
         manifest_parse_func: Optional[Callable] = None,
     ):
         self.parser = parser
+        self.pretokenize = pretokenize
+        self._token_cache: Dict[int, List[int]] = {}
 
         self.collection = collections.ASRAudioText(
             manifests_files=manifest_filepath,
@@ -153,6 +157,8 @@ class ASRManifestProcessor:
             max_number=max_utts,
             index_by_file_id=index_by_file_id,
             parse_func=manifest_parse_func,
+            use_polars=use_polars,
+            pretokenize=pretokenize,
         )
 
         self.eos_id = eos_id
@@ -169,7 +175,17 @@ class ASRManifestProcessor:
         return self.process_text_by_sample(sample)
 
     def process_text_by_sample(self, sample: collections.ASRAudioText.OUTPUT_TYPE) -> Tuple[List[int], int]:
-        t, tl = sample.text_tokens, len(sample.text_tokens)
+        cached = self._token_cache.get(sample.id)
+        if cached is not None:
+            t = cached
+        else:
+            t = sample.text_tokens
+            if t is None:
+                # Lazy tokenize if pretokenize was disabled
+                t = self.parser(sample.text_raw) if sample.text_raw is not None else []
+            self._token_cache[sample.id] = t
+
+        tl = len(t)
 
         if self.bos_id is not None:
             t = [self.bos_id] + t
@@ -447,6 +463,8 @@ class _AudioTextDataset(Dataset):
         return_sample_id: bool = False,
         channel_selector: Optional[ChannelSelectorType] = None,
         manifest_parse_func: Optional[Callable] = None,
+        use_polars: bool = False,
+        pretokenize: bool = True,
         s3_cache_config: Optional[Dict[str, Union[str, int, bool]]] = None,
     ):
         if type(manifest_filepath) == str:
@@ -465,6 +483,8 @@ class _AudioTextDataset(Dataset):
             bos_id=bos_id,
             eos_id=eos_id,
             pad_id=pad_id,
+            use_polars=use_polars,
+            pretokenize=pretokenize,
             manifest_parse_func=manifest_parse_func,
         )
         self.featurizer = WaveformFeaturizer(sample_rate=sample_rate, int_values=int_values, augmentor=augmentor)
@@ -659,6 +679,8 @@ class AudioToCharDataset(_AudioTextDataset):
         return_sample_id: bool = False,
         channel_selector: Optional[ChannelSelectorType] = None,
         manifest_parse_func: Optional[Callable] = None,
+        use_polars: bool = False,
+        pretokenize: bool = True,
         s3_cache_config: Optional[Dict[str, Union[str, int, bool]]] = None,
     ):
         self.labels = labels
@@ -684,6 +706,8 @@ class AudioToCharDataset(_AudioTextDataset):
             channel_selector=channel_selector,
             s3_cache_config=s3_cache_config,
             manifest_parse_func=manifest_parse_func,
+            use_polars=use_polars,
+            pretokenize=pretokenize,
         )
 
 
@@ -753,6 +777,8 @@ class AudioToBPEDataset(_AudioTextDataset):
         return_sample_id: bool = False,
         channel_selector: Optional[ChannelSelectorType] = None,
         manifest_parse_func: Optional[Callable] = None,
+        use_polars: bool = False,
+        pretokenize: bool = True,
         s3_cache_config: Optional[Dict[str, Union[str, int, bool]]] = None,
     ):
         if use_start_end_token and hasattr(tokenizer, "bos_id") and tokenizer.bos_id > 0:
@@ -805,6 +831,8 @@ class AudioToBPEDataset(_AudioTextDataset):
             channel_selector=channel_selector,
             s3_cache_config=s3_cache_config,
             manifest_parse_func=manifest_parse_func,
+            use_polars=use_polars,
+            pretokenize=pretokenize,
         )
 
 
