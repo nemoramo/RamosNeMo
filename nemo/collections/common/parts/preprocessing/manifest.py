@@ -249,13 +249,13 @@ def _item_iter_polars(
                 df.iter_rows(named=True),
                 total=len(df),
                 desc=f"manifest (polars): {os.path.basename(manifest_file)}",
+            )
         except Exception as exc:
             logging.warning(f"Could not import or initialize tqdm progress bar: {exc}. Falling back to plain iterator.")
-        except Exception:
             row_iter = df.iter_rows(named=True)
 
         for row in row_iter:
-                if getattr(parse_func, "__name__", None) == "__parse_item":
+            k += 1
             try:
                 if parse_func is __parse_item:
                     item = __parse_item_from_row(row, manifest_file)
