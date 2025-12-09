@@ -48,7 +48,8 @@ model:
     use_lhotse: false
 
   test_ds:
-    manifest_filepath: ???
+    # Reuse validation manifest for test; override validation_ds.manifest_filepath to change both.
+    manifest_filepath: ${model.validation_ds.manifest_filepath}
     sample_rate: ${model.sample_rate}
     batch_size: 8
     shuffle: false
@@ -189,9 +190,9 @@ model:
     weight_decay: 1e-3
     sched:
       name: CosineAnnealing
-      max_steps: 200000
+      max_steps: 600000
       warmup_steps: 10000
-      min_lr: 1e-6
+      min_lr: 1e-5
 
 trainer:
   devices: -1
@@ -205,7 +206,7 @@ trainer:
     _target_: lightning.pytorch.strategies.DDPStrategy
     gradient_as_bucket_view: true
   accumulate_grad_batches: 1
-  gradient_clip_val: 0.0
+  gradient_clip_val: 10.0
   limit_test_batches: 0
   precision: 16
   log_every_n_steps: 10
