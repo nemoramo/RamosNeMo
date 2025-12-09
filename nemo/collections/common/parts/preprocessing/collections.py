@@ -115,6 +115,7 @@ class AudioText(_Collection):
         max_number: Optional[int] = None,
         do_sort_by_duration: bool = False,
         index_by_file_id: bool = False,
+        pretokenize: bool = True,
     ):
         """Instantiates audio-text manifest with filters and preprocessing.
 
@@ -157,8 +158,12 @@ class AudioText(_Collection):
                 num_filtered += 1
                 continue
 
+            # Tokenization
             if token_labels is not None:
                 text_tokens = token_labels
+            elif not pretokenize:
+                # Lazy mode: tokenize later in DataLoader worker
+                text_tokens = None
             else:
                 if text != '':
                     if hasattr(parser, "is_aggregate") and parser.is_aggregate and isinstance(text, str):
@@ -316,7 +321,15 @@ class VideoText(_Collection):
 class ASRAudioText(AudioText):
     """`AudioText` collector from asr structured json files."""
 
-    def __init__(self, manifests_files: Union[str, List[str]], parse_func: Optional[Callable] = None, *args, **kwargs):
+    def __init__(
+        self,
+        manifests_files: Union[str, List[str]],
+        parse_func: Optional[Callable] = None,
+        use_polars: bool = False,
+        pretokenize: bool = True,
+        *args,
+        **kwargs,
+    ):
         """Parse lists of audio files, durations and transcripts texts.
 
         Args:
@@ -341,7 +354,7 @@ class ASRAudioText(AudioText):
         )
 
         speakers, orig_srs, token_labels, langs = [], [], [], []
-        for item in manifest.item_iter(manifests_files, parse_func=parse_func):
+        for item in manifest.item_iter(manifests_files, parse_func=parse_func, use_polars=use_polars):
             ids.append(item['id'])
             audio_files.append(item['audio_file'])
             durations.append(item['duration'])
@@ -352,7 +365,18 @@ class ASRAudioText(AudioText):
             token_labels.append(item['token_labels'])
             langs.append(item['lang'])
         super().__init__(
-            ids, audio_files, durations, texts, offsets, speakers, orig_srs, token_labels, langs, *args, **kwargs
+            ids,
+            audio_files,
+            durations,
+            texts,
+            offsets,
+            speakers,
+            orig_srs,
+            token_labels,
+            langs,
+            pretokenize=pretokenize,
+            *args,
+            **kwargs,
         )
 
 

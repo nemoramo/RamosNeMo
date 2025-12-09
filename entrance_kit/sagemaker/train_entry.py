@@ -42,11 +42,19 @@ TRAIN_AUDIO_S3        = env("TRAIN_AUDIO_S3", 0, cast=int)
 VAL_AUDIO_S3          = env("VAL_AUDIO_S3",   0, cast=int)
 TRAIN_MANIFEST_S3_URI = os.environ.get("TRAIN_MANIFEST_S3_URI", "")
 VAL_MANIFEST_S3_URI   = os.environ.get("VAL_MANIFEST_S3_URI", "")
+TEST_MANIFEST_ENV     = os.environ.get("TEST_MANIFEST", "")
+CH_TEST               = os.environ.get("SM_CHANNEL_TEST", "")
 
 TRAIN_IS_TARRED    = env("TRAIN_IS_TARRED", 0, cast=int)
 TRAIN_TAR_PATTERN  = os.environ.get("TRAIN_TAR_PATTERN", "")
 VAL_IS_TARRED      = env("VAL_IS_TARRED", 0, cast=int)
 VAL_TAR_PATTERN    = os.environ.get("VAL_TAR_PATTERN", "")
+USE_LHOTSE         = env("USE_LHOTSE", 0, cast=int)
+BATCH_DURATION_TRAIN = os.environ.get("BATCH_DURATION_TRAIN", "")
+BATCH_DURATION_VAL   = os.environ.get("BATCH_DURATION_VAL", "")
+BATCH_DURATION_TEST  = os.environ.get("BATCH_DURATION_TEST", "")
+USE_POLARS         = env("USE_POLARS", 0, cast=int)
+PRETOKENIZE        = env("PRETOKENIZE", 1, cast=int)
 
 if TRAIN_IS_TARRED and TRAIN_AUDIO_S3:
     print("[X] TRAIN_IS_TARRED=1 和 TRAIN_AUDIO_S3=1 不可同时开启")
@@ -66,6 +74,7 @@ TB_DIR        = os.path.join(OUTPUT_BASE, "tensorboard")
 # 训练/评估文件名
 TRAIN_MANIFEST       = env("TRAIN_MANIFEST", required=True)
 VAL_MANIFEST         = env("VAL_MANIFEST",   required=True)
+TEST_MANIFEST        = TEST_MANIFEST_ENV
 PRETRAINED_FILENAME  = env("PRETRAINED_FILENAME", "parakeet-tdt_ctc-110m.nemo")
 CONFIG_NAME          = env("CONFIG_NAME", "fastconformer_hybrid_tdt_ctc_bpe_110m")
 RUN_NAME             = env("RUN_NAME", "nemo-run")
@@ -85,8 +94,10 @@ EMA_DECAY            = env("EMA_DECAY",          0.999, cast=float)
 # 批量与 Loader
 TRAIN_BATCH          = env("TRAIN_BATCH",        "", cast=str)
 VAL_BATCH            = env("VAL_BATCH",          "", cast=str)
+TEST_BATCH           = env("TEST_BATCH",         "", cast=str)
 GRAD_ACCUM           = env("GRAD_ACCUM",         1,   cast=int)
 NUM_WORKERS          = env("NUM_WORKERS",        8,   cast=int)
+TEST_NUM_WORKERS     = env("TEST_NUM_WORKERS",   NUM_WORKERS, cast=int)
 AUTO_BATCH_PER_GPU   = env("AUTO_BATCH_PER_GPU", 1,   cast=int)
 
 # 时长裁剪
@@ -149,6 +160,7 @@ print(f"Run name: {RUN_NAME}")
 print("SM_CHANNELS:", {
     "train": CH_TRAIN if CH_TRAIN else "(none - S3 mode?)",
     "val": CH_VAL,
+    "test": CH_TEST if CH_TEST else "(none)",
     "tokenizer": CH_TOKENIZER,
     "pretrained": CH_PRETRAINED,
 })
@@ -207,11 +219,19 @@ else:
 val_manifest_path = os.path.join(CH_VAL, VAL_MANIFEST)
 val_base_dir = CH_VAL
 
+# test manifest（可选，本地路径）
+test_manifest_path = ""
+if TEST_MANIFEST:
+    if CH_TEST:
+        test_manifest_path = os.path.join(CH_TEST, TEST_MANIFEST)
+    else:
+        test_manifest_path = TEST_MANIFEST
+
 # 3) 关键文件存在性（train manifest 在 S3 模式下已经下载到本地）
 tok_dir   = CH_TOKENIZER
 nemo_path = os.path.join(CH_PRETRAINED, PRETRAINED_FILENAME)
 
-for p in [train_manifest_path, val_manifest_path, tok_dir, nemo_path]:
+for p in [train_manifest_path, val_manifest_path, tok_dir, nemo_path] + ([test_manifest_path] if test_manifest_path else []):
     if not (os.path.isdir(p) or os.path.isfile(p)):
         print("[X] missing:", p); sys.exit(2)
 
@@ -264,12 +284,20 @@ def sample_check_random(manifest_path, base_dir, k=64, seed=None, show_n=10, is_
             continue
 
         if not is_remote:
+            # 本地模式支持绝对路径
+            if rel.startswith("/"):
+                fp = rel
+            else:
+                fp = os.path.join(base_dir, rel)
+            if not os.path.exists(fp):
+                misses.append((idx, fp))
+        else:
+            # 远端模式仍要求相对路径
             if rel.startswith("/"):
                 abs_paths.append((idx, rel))
                 continue
             fp = os.path.join(base_dir, rel)
-            if not os.path.exists(fp):
-                misses.append((idx, fp))
+            # 远端不检查存在性
 
     print(f"[RANDSAMPLE] manifest={manifest_path} seed={seed} picked={len(reservoir)} "
           f"/ seen={total} bad_json={bad_json} is_remote={is_remote}")
@@ -496,6 +524,37 @@ if VAL_IS_TARRED:
         f"model.validation_ds.tarred_audio_filepaths={val_tar_abs}",
     ]
 
+# Lhotse 开关
+if USE_LHOTSE:
+    args += [
+        "model.train_ds.use_lhotse=true",
+        "model.validation_ds.use_lhotse=true",
+    ]
+
+# Polars manifest 开关（仅在非 Lhotse 时生效）
+if USE_POLARS:
+    if USE_LHOTSE:
+        print("[WARN] USE_POLARS=1 ignored because USE_LHOTSE=1")
+    else:
+        args += [
+            "model.train_ds.use_polars=true",
+            "model.validation_ds.use_polars=true",
+        ]
+        if test_manifest_path:
+            args += ["+model.test_ds.use_polars=true"]
+
+# Pretokenize 开关（仅在非 Lhotse 时有意义）
+if not PRETOKENIZE:
+    if USE_LHOTSE:
+        print("[WARN] PRETOKENIZE=0 ignored because USE_LHOTSE=1")
+    else:
+        args += [
+            "model.train_ds.pretokenize=false",
+            "model.validation_ds.pretokenize=false",
+        ]
+        if test_manifest_path:
+            args += ["+model.test_ds.pretokenize=false"]
+
 # batch 大小
 if train_bs_override is not None:
     args += [f"model.train_ds.batch_size={train_bs_override}"]
@@ -507,6 +566,30 @@ args += [
     f"model.train_ds.num_workers={NUM_WORKERS}",
     f"model.validation_ds.num_workers={NUM_WORKERS}",
 ]
+
+# test ds 覆写（可选）
+if test_manifest_path:
+    tb = TEST_BATCH.strip()
+    test_bs = int(tb) if tb else 16
+    args += [
+        f"+model.test_ds.manifest_filepath={test_manifest_path}",
+        "+model.test_ds.shuffle=false",
+        f"+model.test_ds.batch_size={test_bs}",
+        f"+model.test_ds.num_workers={TEST_NUM_WORKERS}",
+        "+model.test_ds.pin_memory=true",
+    ]
+    if USE_LHOTSE:
+        args += ["+model.test_ds.use_lhotse=true"]
+    elif USE_POLARS:
+        args += ["+model.test_ds.use_lhotse=false"]
+
+# Lhotse 动态 batch duration 覆写
+if BATCH_DURATION_TRAIN.strip():
+    args += [f"model.train_ds.batch_duration={BATCH_DURATION_TRAIN.strip()}"]
+if BATCH_DURATION_VAL.strip():
+    args += [f"model.validation_ds.batch_duration={BATCH_DURATION_VAL.strip()}"]
+if test_manifest_path and BATCH_DURATION_TEST.strip():
+    args += [f"+model.test_ds.batch_duration={BATCH_DURATION_TEST.strip()}"]
 
 # 时长裁剪
 if MAX_DURATION_TRAIN.strip():

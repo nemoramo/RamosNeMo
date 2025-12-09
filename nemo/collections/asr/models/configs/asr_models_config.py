@@ -51,6 +51,8 @@ class ASRDatasetConfig(nemo.core.classes.dataset.DatasetConfig):
     bucket_duration_bins: Optional[list] = None
     num_buckets: Optional[int] = 0
     pin_memory: bool = False
+    use_polars: bool = False
+    pretokenize: bool = True
 
     # Optional
     int_values: Optional[int] = None
