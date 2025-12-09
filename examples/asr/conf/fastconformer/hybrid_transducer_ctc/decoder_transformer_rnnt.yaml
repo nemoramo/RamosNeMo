@@ -1,0 +1,17 @@
+# Override snippet to use a causal Transformer prediction network for RNNT/TDT.
+model:
+  decoder:
+    _target_: nemo.collections.asr.modules.TransformerRNNTDecoder
+    blank_as_pad: true
+    prednet:
+      pred_hidden: ${model.model_defaults.pred_hidden}
+      num_layers: 4
+      inner_size: 2560       # 4x pred_hidden
+      num_attention_heads: 8
+      attn_score_dropout: 0.1
+      attn_layer_dropout: 0.1
+      ffn_dropout: 0.1
+      embedding_dropout: 0.1
+      max_sequence_length: 4096
+      learn_positional_encodings: false
+    vocab_size: -1  # filled from tokenizer
