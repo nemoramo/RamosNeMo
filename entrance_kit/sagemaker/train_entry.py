@@ -3,6 +3,10 @@ import os, sys, json, subprocess, random, time
 from pathlib import Path
 from urllib.parse import urlparse
 
+from omegaconf import OmegaConf
+
+from nemo.core.optim.lr_scheduler import compute_max_steps
+
 # --- 兜底：确保优先导入 /opt/nemo 和本仓库根目录 ---
 _p = "/opt/nemo"
 if os.path.isdir(_p) and _p not in sys.path:
@@ -152,6 +156,47 @@ def parse_s3_uri(u: str):
     p = urlparse(u)
     assert p.scheme == "s3", f"not an s3 uri: {u}"
     return p.netloc, p.path.lstrip("/")
+
+
+def load_base_cfg(cfg_dir: str, config_name: str):
+    cfg_path = Path(cfg_dir) / f"{config_name}.yaml"
+    if not cfg_path.is_file():
+        return None
+    try:
+        return OmegaConf.load(cfg_path)
+    except Exception as e:
+        print(f"[WARN] 无法加载配置 {cfg_path}: {e}")
+        return None
+
+
+def cfg_select(cfg, key: str):
+    if cfg is None:
+        return None
+    try:
+        return OmegaConf.select(cfg, key)
+    except Exception:
+        return None
+
+
+def count_manifest_entries(manifest_path: str):
+    try:
+        with open(manifest_path, "r", encoding="utf-8") as f:
+            return sum(1 for line in f if line.strip())
+    except Exception as e:
+        print(f"[WARN] 无法统计 manifest 行数 {manifest_path}: {e}")
+        return None
+
+
+def resolve_device_count(devices_hint: int) -> int:
+    if devices_hint and devices_hint > 0:
+        return devices_hint
+    try:
+        import torch
+
+        cnt = torch.cuda.device_count()
+        return max(1, cnt)
+    except Exception:
+        return 1
 
 print("== PRE-FLIGHT (Script Mode) ==")
 if LANGUAGE_TAG:
@@ -463,10 +508,62 @@ print(f"[valid] enabled={bool(AUG_ON_VAL)} | "
       f"speed={_yn(any('augmentor.speed' in s for s in aug_val_overrides))} "
       f"gain={_yn(any('augmentor.gain'  in s for s in aug_val_overrides))}\n")
 
+# 额外：推断 Cosine LR 所需的 max_steps（若未显式指定）
+nemo_script, nemo_cfg_dir = resolve_nemo_entry()
+base_cfg = load_base_cfg(nemo_cfg_dir, CONFIG_NAME)
+sched_name_in_cfg = cfg_select(base_cfg, "model.optim.sched.name")
+cfg_sched_max_steps = cfg_select(base_cfg, "model.optim.sched.max_steps")
+cfg_train_bs = cfg_select(base_cfg, "model.train_ds.batch_size")
+cfg_drop_last = bool(cfg_select(base_cfg, "model.train_ds.drop_last") or False)
+target_is_cosine = (sched_name_in_cfg is None) or ("cosine" in str(sched_name_in_cfg).lower())
+
+per_gpu_bs_for_sched = train_bs_override or (int(cfg_train_bs) if cfg_train_bs else None)
+sched_max_steps = None
+sched_max_steps_info = ""
+
+if MAX_STEPS_ENV and MAX_STEPS_ENV.strip():
+    try:
+        sched_max_steps = int(MAX_STEPS_ENV.strip())
+        sched_max_steps_info = "来自 MAX_STEPS 环境变量"
+    except ValueError:
+        print(f"[WARN] MAX_STEPS={MAX_STEPS_ENV!r} 不是整数，忽略该值用于调度器")
+elif target_is_cosine:
+    samples = count_manifest_entries(train_manifest_path)
+    device_count_for_sched = resolve_device_count(DEVICES)
+    if samples is not None and per_gpu_bs_for_sched and MAX_EPOCHS > 0:
+        try:
+            sched_max_steps = compute_max_steps(
+                max_epochs=MAX_EPOCHS,
+                accumulate_grad_batches=GRAD_ACCUM,
+                limit_train_batches=1.0,
+                num_workers=device_count_for_sched,
+                num_samples=samples,
+                batch_size=per_gpu_bs_for_sched,
+                drop_last=cfg_drop_last,
+            )
+            sched_max_steps_info = (
+                f"估算值：samples={samples} per_gpu_bs={per_gpu_bs_for_sched} "
+                f"devices={device_count_for_sched} grad_accum={GRAD_ACCUM} epochs={MAX_EPOCHS}"
+            )
+        except Exception as e:
+            print(f"[WARN] 估算调度器 max_steps 失败：{e}")
+    else:
+        print("[WARN] 缺少 batch_size 或样本数，无法推断调度器 max_steps")
+
+if sched_max_steps is not None and target_is_cosine:
+    if cfg_sched_max_steps not in (None, -1):
+        print(f"[SCHED] 覆盖原有调度器 max_steps={cfg_sched_max_steps} -> {sched_max_steps}")
+    else:
+        print(f"[SCHED] 设置调度器 max_steps={sched_max_steps}")
+    if sched_max_steps_info:
+        print(f"[SCHED] 来源：{sched_max_steps_info}")
+else:
+    if target_is_cosine:
+        print("[SCHED] Cosine 调度器 max_steps 未设置，将使用配置文件默认值")
+
 print("== PRE-FLIGHT PASSED ==\n")
 
 # 8) 组装 Hydra 覆写并启动 NeMo 训练
-nemo_script, nemo_cfg_dir = resolve_nemo_entry()
 args = [
     sys.executable, nemo_script,
     f"--config-path={nemo_cfg_dir}",
@@ -500,6 +597,9 @@ args = [
 
 if MAX_STEPS_ENV and MAX_STEPS_ENV.strip():
     args += [f"trainer.max_steps={MAX_STEPS_ENV.strip()}", "trainer.max_epochs=null"]
+
+if sched_max_steps is not None and target_is_cosine:
+    args += [f"++model.optim.sched.max_steps={sched_max_steps}"]
 
 # EMA 开关与衰减
 if EMA_ENABLE:
