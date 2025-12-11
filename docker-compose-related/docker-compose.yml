@@ -12,10 +12,11 @@ services:
       # 数据目录
       - /data1:/data1
       - /data2:/data2
+      - /data3:/data3
       - ../logs:/workspace/logs
 
       # RamosNeMo 源码目录 - 使用本地 entrance 脚本
-      - ../RamosNeMo:/opt/ramosnemo_source
+      - ..:/opt/ramosnemo_source
 
     environment:
       - CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
