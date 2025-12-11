@@ -13,6 +13,7 @@ services:
       - /data1:/data1
       - /data2:/data2
       - /data3:/data3
+      - /mnt/asr-audio-data:/mnt/asr-audio-data
       - ../logs:/workspace/logs
 
       # RamosNeMo 源码目录 - 使用本地 entrance 脚本
